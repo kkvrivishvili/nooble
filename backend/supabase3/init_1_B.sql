@@ -17,7 +17,7 @@ CREATE SCHEMA IF NOT EXISTS auth;       -- Esquema para autenticación pública
 CREATE SCHEMA IF NOT EXISTS audit;      -- Esquema para registros de auditoría
 
 -- Configurar search path para incluir todos los esquemas necesarios
-ALTER DATABASE CURRENT_USER SET search_path TO public, app, extensions, "$user";
+ALTER ROLE current_user SET search_path TO public, app, extensions, "$user";
 
 -- Configuración inicial de la base de datos
 SET client_encoding = 'UTF8';
