@@ -6,6 +6,8 @@ DROP TABLE IF EXISTS profiles CASCADE;
 DROP TABLE IF EXISTS user_roles CASCADE;
 DROP TABLE IF EXISTS subscriptions CASCADE;
 DROP FUNCTION IF EXISTS sync_user_config_on_subscription_change CASCADE;
+DROP FUNCTION IF EXISTS generate_unique_username CASCADE;
+DROP FUNCTION IF EXISTS handle_new_user CASCADE;
 
 -- Tabla de Perfiles mejorada
 CREATE TABLE IF NOT EXISTS profiles (
@@ -185,8 +187,216 @@ AFTER INSERT OR UPDATE ON user_roles
 FOR EACH ROW
 EXECUTE PROCEDURE track_role_changes();
 
+-- =============================================
+-- SECCIÓN: Automatización de creación de usuarios y suscripciones
+-- =============================================
+
+-- Función para generar un username único basado en el email
+CREATE OR REPLACE FUNCTION generate_unique_username(p_email TEXT) 
+RETURNS TEXT AS $$
+DECLARE
+  base_username TEXT;
+  candidate_username TEXT;
+  username_exists BOOLEAN;
+  counter INTEGER := 0;
+BEGIN
+  -- Extraer la parte antes del @ como base para el username
+  base_username := split_part(p_email, '@', 1);
+  
+  -- Reemplazar caracteres no permitidos y limitar longitud
+  base_username := regexp_replace(base_username, '[^a-z0-9_\.]', '', 'gi');
+  base_username := substring(base_username, 1, 20);
+  
+  -- Verificar si ya existe
+  candidate_username := base_username;
+  
+  LOOP
+    -- Comprobar si el username ya existe
+    SELECT EXISTS (
+      SELECT 1 FROM users WHERE username = candidate_username
+    ) INTO username_exists;
+    
+    -- Si no existe o hemos intentado demasiadas veces, salir del bucle
+    EXIT WHEN NOT username_exists OR counter > 100;
+    
+    -- Incrementar contador y generar nuevo candidato
+    counter := counter + 1;
+    candidate_username := base_username || counter;
+  END LOOP;
+  
+  -- Si después de 100 intentos sigue existiendo, usar un UUID parcial
+  IF username_exists THEN
+    candidate_username := base_username || '_' || substr(uuid_generate_v4()::text, 1, 8);
+  END IF;
+  
+  RETURN candidate_username;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Función para manejar nuevos usuarios cuando se registran en auth
+CREATE OR REPLACE FUNCTION handle_new_user()
+RETURNS TRIGGER AS $$
+DECLARE
+  default_theme_id UUID;
+  user_id UUID;
+  username_from_meta TEXT;
+  display_name_from_meta TEXT;
+  generated_username TEXT;
+  current_date TIMESTAMP WITH TIME ZONE := NOW();
+  period_end TIMESTAMP WITH TIME ZONE;
+BEGIN
+  -- Obtener ID de tema por defecto (usamos el primero, normalmente 'Default')
+  SELECT id INTO default_theme_id FROM themes WHERE name = 'Default';
+  IF default_theme_id IS NULL THEN
+    SELECT id INTO default_theme_id FROM themes LIMIT 1;
+  END IF;
+  
+  -- Extraer información de metadatos si están disponibles
+  username_from_meta := NEW.raw_user_meta_data->>'username';
+  display_name_from_meta := NEW.raw_user_meta_data->>'display_name';
+  
+  -- Generar un username único si no se proporcionó uno
+  IF username_from_meta IS NULL OR trim(username_from_meta) = '' THEN
+    generated_username := generate_unique_username(NEW.email);
+  ELSE
+    -- Validar y limpiar el username proporcionado
+    IF username_from_meta ~* '^[a-z0-9_\.]{3,30}$' THEN
+      generated_username := username_from_meta;
+    ELSE
+      -- Si no cumple con el formato, generar uno basado en el email
+      generated_username := generate_unique_username(NEW.email);
+    END IF;
+    
+    -- Verificar si ya existe
+    IF EXISTS (SELECT 1 FROM users WHERE username = generated_username) THEN
+      generated_username := generate_unique_username(NEW.email);
+    END IF;
+  END IF;
+  
+  -- Insertar en la tabla users
+  INSERT INTO users (
+    auth_id, 
+    username, 
+    email, 
+    display_name, 
+    theme_id, 
+    last_login_at
+  ) VALUES (
+    NEW.id, 
+    generated_username, 
+    NEW.email, 
+    COALESCE(display_name_from_meta, split_part(NEW.email, '@', 1)), 
+    default_theme_id,
+    current_date
+  )
+  RETURNING id INTO user_id;
+  
+  -- Insertar en la tabla profiles
+  INSERT INTO profiles (
+    id,
+    meta_title,
+    meta_description
+  ) VALUES (
+    user_id,
+    generated_username || '''s Links',
+    'Check out my links and resources'
+  );
+  
+  -- Insertar en user_roles con rol de usuario estándar
+  INSERT INTO user_roles (
+    user_id, 
+    role, 
+    permissions,
+    notes
+  ) VALUES (
+    user_id, 
+    'user', 
+    '{"create_links": true, "create_bots": true, "customize_profile": true}',
+    'Rol asignado automáticamente durante registro'
+  );
+  
+  -- Calcular el período de finalización para la suscripción gratuita (1 año desde ahora)
+  period_end := current_date + INTERVAL '1 year';
+  
+  -- Crear suscripción gratuita automáticamente
+  INSERT INTO subscriptions (
+    user_id,
+    plan_type,
+    status,
+    current_period_start,
+    current_period_end,
+    auto_renew,
+    meta_data
+  ) VALUES (
+    user_id,
+    'free',
+    'active',
+    current_date,
+    period_end,
+    TRUE,
+    jsonb_build_object(
+      'registration_source', COALESCE(NEW.raw_user_meta_data->>'source', 'direct'),
+      'auto_created', true
+    )
+  );
+  
+  -- Insertar un link inicial de bienvenida
+  BEGIN
+    INSERT INTO links (
+      user_id,
+      title,
+      url,
+      position,
+      is_active,
+      is_featured
+    ) VALUES (
+      user_id,
+      'Welcome to My Linktree',
+      'https://docs.linktree.com/welcome',
+      1,
+      TRUE,
+      TRUE
+    );
+  EXCEPTION WHEN OTHERS THEN
+    -- Si la tabla links aún no existe, registrar pero continuar
+    -- Esto puede ocurrir durante la configuración inicial
+    NULL;
+  END;
+  
+  -- Log del sistema para registrar la creación automática (si la función existe)
+  BEGIN
+    PERFORM log_system_error(
+      user_id,
+      'user_creation',
+      'Usuario creado automáticamente con plan gratuito',
+      'info',
+      'auth',
+      jsonb_build_object(
+        'email', NEW.email,
+        'username', generated_username,
+        'auth_id', NEW.id,
+        'subscription_end', period_end
+      )
+    );
+  EXCEPTION WHEN OTHERS THEN
+    -- Si la función log_system_error aún no existe, continuar sin error
+    -- Esto puede ocurrir durante la configuración inicial
+    NULL;
+  END;
+  
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Trigger que se dispara cuando se crea un nuevo usuario en auth
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+AFTER INSERT ON auth.users
+FOR EACH ROW
+EXECUTE FUNCTION handle_new_user();
+
 -- Notificación de finalización
 DO $$
 BEGIN
-  RAISE NOTICE 'Tablas dependientes de Users creadas correctamente.';
+  RAISE NOTICE 'Tablas dependientes de Users creadas correctamente con automatización de usuarios.';
 END $$;
