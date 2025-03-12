@@ -1,0 +1,100 @@
+-- Análisis del archivo init_3.sql - Tablas Dependientes de Users
+
+-- ==============================================
+-- ARCHIVO: init_3.sql - Tablas Dependientes de Users - ANÁLISIS
+-- ==============================================
+-- Resumen del Propósito:
+-- El archivo init_3.sql crea tablas que dependen de `app.users`, incluyendo `profiles`, `user_roles`, `user_role_history`, `subscriptions`, `subscription_history`.
+-- Sigue la reorganización de esquemas, manteniendo `profiles` en 'public' y moviendo roles/permissions and subscriptions related tables to 'app'.
+-- Implementa la función `handle_new_user` y trigger `on_auth_user_created` for automatic user creation upon authentication.
+
+-- ---------- SECCIÓN 1: PERFILES DE USUARIO - ANÁLISIS ----------
+-- **INCONSISTENCIA DETECTADA**:  Redundancia de comandos DROP.  Again, multiple DROP statements for `profiles`, `user_roles`, `subscriptions`, `user_role_history`, `subscription_history` with and without schema prefixes. **Recomendación: Remove redundant DROP statements.**
+-- **DEPENDENCIA CLAVE DETECTADA**: Verification `DO $$ BEGIN IF NOT EXISTS (...) THEN RAISE EXCEPTION ... END IF; END $$;` to ensure `app.users` table exists.
+--  **OK**: CORRECT and essential dependency check on `init_2.sql`.
+-- OK: Table `public.profiles` is well-defined, placed in the correct 'public' schema.
+-- OK: Foreign Key `id UUID PRIMARY KEY REFERENCES app.users(id) ON DELETE CASCADE` correctly links to `app.users`. `ON DELETE CASCADE` is appropriate, as profile should be deleted if user is deleted.
+-- OK: CHECK constraints for social media handles (`social_twitter`, `social_instagram` etc.) are basic but helpful for format validation. `website`, `custom_domain`, `chat_avatar_url` are also validated with regex for URLs/domains.
+-- OK: Indices `idx_profiles_custom_domain`, `idx_profiles_verified`, `idx_profiles_public_chat`, `idx_profiles_social_handles` are appropriate for query optimization. `idx_profiles_social_handles` using GIN and `to_tsvector` is good for text search on social handles, though the weighting to `english` dictionary might need to be reviewed if supporting multi-language search in the future.
+-- OK: Comprehensive comments for table and columns.
+
+-- ---------- SECCIÓN 2: ROLES Y PERMISOS DE USUARIO - ANÁLISIS ----------
+-- **INCONSISTENCIA DETECTADA**:  Redundancy in DROP TABLE statements (as in previous sections). **Recomendación: Remove redundant DROPs.**
+-- OK: Table `app.user_roles` designed for user roles and permissions, correctly placed in 'app' schema.
+-- OK: `user_id UUID PRIMARY KEY REFERENCES app.users(id) ON DELETE CASCADE` is correct.
+-- OK: `role VARCHAR(20) NOT NULL CHECK (role IN (...))` constraint for predefined roles.
+-- OK: `permissions JSONB DEFAULT '{...}'` provides flexible permission storage using JSONB, with a default set of permissions.  Good approach for flexibility.
+-- OK: `granted_by UUID REFERENCES app.users(id) ON DELETE SET NULL` allows tracking who granted the role, `ON DELETE SET NULL` is reasonable, keeping role assignment even if granter is deleted.
+-- OK: Indices `idx_user_roles_role`, `idx_user_roles_granted_by` for query optimization.
+-- OK: Comments.
+
+-- ---------- SECCIÓN 3: SUSCRIPCIONES Y PAGOS - ANÁLISIS ----------
+-- **INCONSISTENCIA DETECTADA**: Redundant DROP TABLE statements (consistent pattern). **Recomendación: Remove redundant DROPs.**
+-- **DEPENDENCIA CLAVE DETECTADA**: `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'system_config') THEN RAISE WARNING ... END IF; END $$;`  This is unusual in this section related to 'subscriptions', which should primarily depend on `app.users`. It seems to be a leftover from a previous section or potentially misplaced. `app.system_config` is more relevant for `user_config` and potentially `subscription_plan_config` from `init_2.sql`. **Questionable dependency check here - review if this check is really necessary in this section, or a copy-paste error. It might be intended as a general dependency safety net, but it's not directly related to subscriptions' dependencies.**
+-- OK: Table `app.subscriptions` for subscription management, correctly in 'app' schema.
+-- OK: `user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE` is correct.
+-- OK: CHECK constraints for `plan_type`, `status`, `currency`, `subscription_period_check`.
+-- OK: Datatypes for financial fields (`recurring_amount DECIMAL(10,2)`) and dates (`TIMESTAMP WITH TIME ZONE`) are appropriate.
+-- OK: JSONB for `meta_data` and JSONB array for `llm_available_models` are good for flexible metadata and plan features.
+-- OK: Indices `idx_active_subscriptions`, `idx_subscriptions_status`, `idx_subscriptions_expiring`, `idx_subscriptions_plan_type`, `idx_subscriptions_tokens_running_out` are well chosen for subscription management queries and alerts. `idx_active_subscriptions` UNIQUE index constraint seems intended to enforce only one active subscription per user, which is likely desired.
+-- OK: Table `app.subscription_history` for tracking subscription changes.
+-- OK: Foreign Keys and CHECK constraints in `app.subscription_history` are consistent with `app.subscriptions`.
+-- OK: Indices `idx_subscription_history_user`, `idx_subscription_history_subscription`, `idx_subscription_history_created_at` for audit logging queries.
+-- OK: Comments for both `app.subscriptions` and `app.subscription_history` are comprehensive.
+
+-- ---------- SECCIÓN 4: TRIGGERS Y FUNCIONES - ANÁLISIS ----------
+-- **DEPENDENCIA CLAVE DETECTADA**: Verification `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'user_config') THEN RAISE WARNING ... END IF; ... IF NOT EXISTS ... app.subscription_plan_config ... THEN RAISE WARNING ... END IF; END $$;` before creating `sync_user_config_on_subscription_change` function.
+--  **OK**: CORRECT and essential dependency check, ensuring tables from `init_2.sql` are in place. Using `RAISE WARNING` is less strict, allowing trigger creation to proceed even if dependencies aren't fully met (perhaps for development/testing, but `RAISE EXCEPTION` would be more robust in production setup).
+-- OK: Function `sync_user_config_on_subscription_change()` and trigger `sync_config_on_subscription_change` to synchronize user config on subscription changes. Logic seems reasonable:
+    -- Checks for dependency tables (`system_config`, `user_config`, `subscription_plan_config`).
+    -- Logs subscription changes to `app.subscription_history`.
+    -- On plan change or status change to 'active', it inserts default configurations from `app.subscription_plan_config` into `app.user_config` for the user.
+    -- Updates `public.profiles.enable_public_chat` based on `subscription_plan_config.enable_public_chat`.
+-- OK: Function `track_role_changes()` and trigger `track_user_role_changes` to log user role changes to `app.user_role_history`. Logic is straightforward and correct for auditing role changes.
+
+-- ---------- SECCIÓN 5: AUTOMATIZACIÓN DE USUARIOS - ANÁLISIS ----------
+-- OK: Function `generate_unique_username(p_email TEXT)` for generating unique usernames based on email. Logic is sound:
+    -- Extracts base username from email.
+    -- Cleans and truncates base username.
+    -- Loops to append a counter if username already exists, up to 100 attempts.
+    -- If still not unique after 100 attempts, appends a partial UUID.
+    -- Handles edge cases and potential username collisions well.
+-- OK: Function `handle_new_user()` and trigger `on_auth_user_created` to handle new user creation upon auth registration. Complex and feature-rich function:
+    -- Extensive checks for existence of various tables (`themes`, `profiles`, `user_roles`, `links`, `subscriptions`) and `log_system_error` function to prevent errors if parts of schema are missing (dependency checks are good and comprehensive).
+    -- Gets default theme.
+    -- Extracts username/display name from `raw_user_meta_data`.
+    -- Generates unique username using `generate_unique_username` if not provided or invalid.
+    -- Inserts into `app.users` table.
+    -- Inserts into `public.profiles` (if table exists).
+    -- Assigns default 'user' role in `app.user_roles` (if table exists).
+    -- Creates a 'free' subscription in `app.subscriptions` (if table exists) with a 1-year validity, token limits, and sets metadata about registration source and auto-creation.
+    -- Creates a welcome link in `public.links` (if table exists).
+    -- Calls `log_system_error` (if function exists) to log user creation event.
+--  **POTENTIAL ISSUE/QUESTION**:  `handle_new_user` function makes extensive checks for table and function existence *within* the function itself.  While robust, this could indicate that the script execution order and dependency management might still rely on these runtime checks rather than stricter script-level dependency enforcement.  **Question**: Is it intended that parts of the schema might be partially deployed, and the system should gracefully handle missing tables/functions? If yes, these checks are good. If a complete schema deployment is expected, stricter script dependency management (and potentially `RAISE EXCEPTION` in dependency checks instead of `RAISE WARNING`) might be preferable.
+
+-- ---------- SECCIÓN 6: VISTAS DE COMPATIBILIDAD - ANÁLISIS ----------
+-- OK: Creation of compatibility views `user_roles`, `subscriptions`, `user_role_history`, `subscription_history` without schema prefix. Same **PRECAUTION** as in `init_2.sql`: these views rely on the correct `search_path`. **Recomendación**: Consider using fully qualified names (schema.view_name) or decide on a target schema for these views (public or app) and place them there with explicit schema names in `CREATE VIEW` statements.
+
+-- ---------- SECCIÓN FINAL: NOTIFICACIÓN - ANÁLISIS ----------
+-- OK: `RAISE NOTICE` messages for confirmation.
+
+-- ==============================================
+-- RESUMEN GENERAL DEL ARCHIVO init_3.sql - INCONSISTENCIAS Y SUGERENCIAS
+-- ==============================================
+-- INCONSISTENCIA PRINCIPAL DETECTADA:
+--  - **Redundant DROP TABLE statements**:  Repeated DROPs, needs cleanup. **RECOMENDACIÓN: Remove redundant DROP statements.**
+--  - **Questionable Dependency Check in Subscriptions Section**: The `app.system_config` check in Section 3 (Subscriptions) is likely misplaced or unnecessary.  **RECOMENDACIÓN: Remove or relocate the `app.system_config` check in Section 3 if it's not intentionally a generic dependency safety net. If it's intentional, document why.**
+
+-- DEPENDENCIAS CLAVE CORRECTAMENTE MANEJADAS:
+--  - **Dependency on `init_2.sql` (app.users)**:  Correctly checked at the beginning of `init_3.sql`.
+--  - **Dependency on `init_2.sql` (user_config, subscription_plan_config) and `init_1.sql` (system_config)**:  Checked in `sync_user_config_on_subscription_change` function.
+
+-- SUGERENCIAS DE MEJORA:
+--  1. **Eliminate redundant DROP commands**: Clean up DROP sections.
+--  2. **Nombres completamente calificados para vistas**:  As with `init_2.sql`, consider fully qualifying view names or decide on target schema and use explicit schema names for views.
+--  3. **Review Dependency Checks and Error Handling in `handle_new_user` and `sync_user_config_on_subscription_change`**: Decide if extensive runtime table/function existence checks are intended for partial schema deployment or if stricter script-level dependency management and `RAISE EXCEPTION` for missing dependencies would be more appropriate for a production setup.
+--  4. **Review `app.system_config` dependency check in Subscription Section**: Clarify if the `app.system_config` check in Section 3 is intentional or misplaced.
+
+-- PRÓXIMO PASO:
+--  Please provide the next file `init_4.sql` to continue the sequential analysis and verify consistency.
+--  `init_3.sql` introduces complex logic for user automation and subscription management, with generally good dependency handling and table design.  The main areas for improvement remain cleaning up redundant DROPs and clarifying the dependency check and error handling strategy, especially within functions.

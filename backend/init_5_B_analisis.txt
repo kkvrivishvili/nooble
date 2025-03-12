@@ -1,0 +1,92 @@
+-- Análisis del archivo init_5.sql - Tablas de Enlaces y Analytics
+
+-- ==============================================
+-- ARCHIVO: init_5.sql - Tablas de Enlaces y Analytics - ANÁLISIS
+-- ==============================================
+-- Resumen del Propósito:
+-- El archivo init_5.sql crea tablas para enlaces (Linktree - en esquema 'public'), analytics, monitoreo de uso,
+-- sistema de cuotas y notificaciones (todos en esquema 'app').
+-- El script mueve las tablas system_errors, analytics, usage_metrics y quota_notifications al esquema 'app'
+-- para una mejor separación de datos internos y públicos.
+
+-- ---------- SECCIÓN PRELIMINAR: VERIFICACIONES INICIALES - ANÁLISIS ----------
+-- **DEPENDENCIA CLAVE DETECTADA**: Verificación de dependencias cruciales al inicio del script mediante bloques `DO $$ BEGIN IF NOT EXISTS (...) THEN RAISE EXCEPTION ... END IF; END $$;`.
+--  **OK**: CORRECTO.  Verifica la existencia de `app.users` (esencial) y `public.bots` (advertencia si no existe, pero permite continuar). Las dependencias se gestionan de forma adecuada al inicio del script.
+-- OK: Verificación de la existencia del esquema 'app' y creación si no existe. Esto asegura que el esquema 'app' esté disponible para las tablas internas. `RAISE NOTICE` es adecuado para informar sobre la creación del esquema.
+
+-- ---------- SECCIÓN INICIAL: ELIMINACIÓN DE OBJETOS EXISTENTES - ANÁLISIS ----------
+-- OK: Eliminación de vistas de compatibilidad (`DROP VIEW IF EXISTS ... CASCADE;`) antes de las tablas, lo cual es una buena práctica para evitar dependencias circulares durante la eliminación.
+-- OK: Eliminación de funciones y triggers (`DROP FUNCTION IF EXISTS ... CASCADE;`, `DROP TRIGGER IF EXISTS ... ON ...;`) antes de recrearlas.
+-- OK: Eliminación de índices de forma iterativa verificando su existencia (`DO $$ DECLARE ... FOR i IN ... LOOP ... SELECT EXISTS ... EXECUTE 'DROP INDEX IF EXISTS ...'; END LOOP; END $$;`).  Este enfoque es robusto y evita errores si los índices no existen previamente.
+-- **INCONSISTENCIA DETECTADA**: Redundancia de comandos DROP TABLE (¡la persistencia de la redundancia continúa!).  Múltiples comandos DROP para las mismas tablas, algunos sin esquema y otros con esquema explícito (`DROP TABLE IF EXISTS app.system_errors CASCADE;` vs `DROP TABLE IF EXISTS system_errors CASCADE;`). **RECOMENDACIÓN: Eliminar los comandos redundantes DROP TABLE.** Mantener solo una línea DROP TABLE por tabla, preferiblemente con el esquema explícito para mayor claridad.
+-- OK: Eliminación de particiones de analytics tanto en el esquema 'public' (por si existían previamente) como en 'app', utilizando cursores para iterar sobre las particiones y eliminarlas de forma individual.  El manejo de errores con `BEGIN...EXCEPTION WHEN OTHERS THEN RAISE WARNING...END;` dentro del bucle es adecuado para la eliminación de particiones.
+
+-- ---------- SECCIÓN 1: TABLAS DE ENLACES (LINKTREE) - ANÁLISIS ----------
+-- OK: Tabla `public.links` para la gestión de enlaces, correctamente ubicada en el esquema 'public'.
+-- OK: Clave foránea `user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE`.
+-- OK: Validación de URLs mediante `CHECK (url IS NULL OR url ~* '^https?://...')` en campos `url` y `thumbnail_url`.
+-- OK: Restricciones `CONSTRAINT link_has_destination CHECK (...)` para asegurar que un enlace tenga un destino (URL o bot_id) y `CONSTRAINT link_visibility_check CHECK (...)` para evitar configuraciones de visibilidad contradictorias (`mobile_only` y `desktop_only` ambos TRUE).
+-- **DEPENDENCIA CONDICIONAL DETECTADA**:  La columna `bot_id` es una clave foránea *condicional* a `public.bots`. La adición de la clave foránea se realiza mediante un bloque `DO $$ BEGIN IF EXISTS (...) THEN ALTER TABLE ... ADD CONSTRAINT ...; END IF; END $$;`. **OK**: CORRECTO.  Esto gestiona la dependencia opcional de `public.bots` y permite que el script se ejecute incluso si `public.bots` aún no se ha creado (aunque se emite un `RAISE WARNING` en la verificación inicial).
+-- OK: Índices mejorados para `public.links`: `idx_links_user_position`, `idx_links_bot_id`, `idx_links_active`, `idx_links_featured`, `idx_links_date_range`, `idx_links_title_search`.  Índices bien seleccionados para optimizar consultas comunes sobre enlaces.
+-- OK: Tabla `public.link_groups` para la agrupación de enlaces, en el esquema 'public'.
+-- OK: Clave foránea `user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE`.
+-- OK: Índice `idx_link_groups_user`, `idx_link_groups_name` para consultas sobre grupos de enlaces.
+-- OK: Tabla `public.link_group_items` para la relación muchos-a-muchos entre enlaces y grupos, en el esquema 'public'.
+-- OK: Claves foráneas `link_id UUID NOT NULL REFERENCES public.links(id) ON DELETE CASCADE`, `group_id UUID NOT NULL REFERENCES public.link_groups(id) ON DELETE CASCADE`.
+-- OK: Índice compuesto `idx_link_group_items_group` para consultas sobre ítems dentro de grupos y `idx_link_group_items_link` para consultas por enlace.
+
+-- ---------- SECCIÓN 2: TABLAS DE ERRORES Y MONITOREO (esquema 'app') - ANÁLISIS ----------
+-- OK: Tabla `app.system_errors` para registrar errores del sistema, correctamente movida al esquema 'app'.
+-- OK: Clave foránea `user_id UUID REFERENCES app.users(id) ON DELETE SET NULL`, `resolved_by UUID REFERENCES app.users(id) ON DELETE SET NULL`.
+-- OK: `severity VARCHAR(20) DEFAULT 'error' CHECK (severity IN (...))` para restringir los niveles de severidad.
+-- OK: `context JSONB DEFAULT '{}'` para almacenar información de contexto adicional en formato JSON.
+-- OK: Índices para `app.system_errors`: `idx_system_errors_type`, `idx_system_errors_user`, `idx_system_errors_severity`, `idx_system_errors_date`, `idx_system_errors_resolved`, `idx_system_errors_source`. Índices bien seleccionados para análisis y gestión de errores.
+-- OK: Función `log_system_error(...)` para insertar registros en la tabla `app.system_errors`.
+--  **OK**:  La función maneja la validación de la severidad, añade un timestamp al contexto, inserta el error en la tabla, y genera un `RAISE WARNING` para errores críticos. El manejo de excepciones dentro de la función (`EXCEPTION WHEN OTHERS THEN RAISE WARNING...`) es apropiado para la robustez del logging.  El uso de `SECURITY DEFINER` es correcto para funciones de logging que pueden ser llamadas desde contextos con menos privilegios.
+
+-- ---------- SECCIÓN 3: TABLAS DE MÉTRICAS Y NOTIFICACIONES - ANÁLISIS ----------
+-- OK: Tabla `app.usage_metrics` para el seguimiento de métricas de uso, correctamente en el esquema 'app'.
+-- OK: Clave foránea `user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE`.
+-- OK: `metric_type VARCHAR(30) NOT NULL`, `year_month INTEGER NOT NULL`, `daily_breakdown JSONB DEFAULT '{}'`.
+-- OK: Índices para `app.usage_metrics`: `idx_usage_metrics_unique`, `idx_usage_metrics_type`, `idx_usage_metrics_reset`, `idx_usage_metrics_user_metrics`. El índice único compuesto `idx_usage_metrics_unique` es crucial para evitar duplicados en las métricas.
+-- OK: Tabla `app.quota_notifications` para el registro de notificaciones de cuota, correctamente en el esquema 'app'.
+-- OK: Clave foránea `user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE`.
+-- OK: `threshold_percent INTEGER NOT NULL`, `year_month INTEGER NOT NULL`, `is_read BOOLEAN DEFAULT FALSE`.
+-- OK: Índices para `app.quota_notifications`: `idx_quota_notifications_user`, `idx_quota_notifications_month`, `idx_quota_notifications_sent`. Índices adecuados para la gestión y consulta de notificaciones de cuota.
+
+-- ---------- SECCIÓN 4: ANALÍTICA PARTICIONADA (esquema 'app') - ANÁLISIS ----------
+-- OK: Tabla `app.analytics` para el almacenamiento de datos analíticos, movida al esquema 'app' y particionada por `created_at`.
+-- OK: `PARTITION BY RANGE (created_at)`. `PRIMARY KEY (id, created_at)`.
+-- OK: Clave foránea `user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE`, y referencia condicional a `link_id UUID` (manejada similar a `bot_id` en `public.links`).
+-- **DEPENDENCIA CONDICIONAL DETECTADA**: La columna `link_id` tiene una clave foránea *condicional* a `public.links`. La adición de la clave foránea se realiza de forma similar a `bot_id` en `public.links`, mediante un bloque `DO $$ BEGIN IF EXISTS (...) THEN ALTER TABLE ... ADD CONSTRAINT ...; END IF; END $$;`. **OK**: CORRECTO manejo de dependencia condicional.
+
+-- ---------- SECCIÓN 5: FUNCIONES Y TRIGGERS - ANÁLISIS ----------
+-- OK: Función `check_quota_thresholds()` y trigger `trigger_quota_threshold_check` para monitorear y notificar sobre el uso de cuotas.
+--  **OK**: La función `check_quota_thresholds()` calcula el porcentaje de uso de la cuota y verifica umbrales (80%, 90%, 100%).  Utiliza `FOR UPDATE` en la consulta para evitar condiciones de carrera al verificar la existencia de notificaciones.  Crea notificaciones en `app.quota_notifications` y registra eventos en `app.system_errors` (si la función `log_system_error` existe). El uso de `SECURITY DEFINER` para `check_quota_thresholds()` es correcto para funciones que interactúan con datos de seguridad o políticas de cuotas. El trigger `trigger_quota_threshold_check` se dispara correctamente `AFTER INSERT OR UPDATE OF count, quota_limit ON app.usage_metrics`.
+-- OK: Función `create_analytics_partition()` y trigger `create_analytics_partition_trigger` para la creación automática de particiones mensuales para la tabla `app.analytics`.
+--  **OK**:  Similar a `init_4.sql`, la función `create_analytics_partition()` gestiona la creación de particiones mensuales y la creación anticipada de particiones para los próximos dos meses.  **MEJORA IMPORTANTE**:  **Este script añade la habilitación de Row Level Security (RLS) y la creación de políticas RLS (`analytics_partition_select_policy`, `analytics_partition_insert_policy`) para cada partición de `app.analytics`.** Esto es una **mejora significativa en seguridad**, asegurando que el acceso a los datos analíticos está controlado por políticas RLS. Las políticas RLS implementadas (`analytics_partition_select_policy` y `analytics_partition_insert_policy`) parecen razonables para controlar el acceso a los datos analíticos.  Se generan índices específicos para cada partición, y se gestionan errores durante la creación de particiones y políticas. El trigger `create_analytics_partition_trigger` se define correctamente como `BEFORE INSERT ON app.analytics FOR EACH ROW EXECUTE FUNCTION create_analytics_partition()`.
+
+-- ---------- SECCIÓN FINAL: NOTIFICACIÓN - ANÁLISIS ----------
+-- OK: `RAISE NOTICE` para confirmar la creación de las tablas de enlaces y analytics.
+
+-- ==============================================
+-- RESUMEN GENERAL DEL ARCHIVO init_5.sql - INCONSISTENCIAS Y SUGERENCIAS
+-- ==============================================
+-- INCONSISTENCIA PRINCIPAL DETECTADA:
+--  - **Redundant DROP TABLE statements**:  La redundancia en los comandos DROP TABLE persiste. **RECOMENDACIÓN: Eliminar los comandos redundantes DROP TABLE.**
+
+-- PUNTOS FUERTES:
+--  - **Gestión de Dependencias**:  Dependencias cruciales verificadas al inicio. Dependencias condicionales (a `public.bots` y `public.links`) gestionadas correctamente mediante bloques `IF EXISTS`.
+--  - **Seguridad Mejorada con RLS**:  La implementación de Row Level Security (RLS) para la tabla `app.analytics` y sus particiones es una **excelente mejora en seguridad**.  Las políticas RLS parecen bien definidas para controlar el acceso a los datos analíticos.
+--  - **Particionamiento Robusto**:  El particionamiento de `app.analytics` se mantiene robusto con la creación automática de particiones mensuales y la creación anticipada de particiones.
+--  - **Función de Logging `log_system_error`**:  Función de logging bien implementada y robusta para registrar errores del sistema.
+--  - **Monitoreo de Cuotas**:  Implementación del monitoreo de cuotas y notificaciones mediante `check_quota_thresholds()` y `trigger_quota_threshold_check` es funcional y considera la concurrencia.
+--  - **Índices Bien Definidos**:  Índices apropiados para todas las tablas para optimizar consultas comunes.
+
+-- SUGERENCIAS DE MEJORA:
+--  1. **Eliminar comandos redundantes DROP**: Limpiar las secciones de DROP.
+--  2. **Revisar y documentar políticas RLS para `app.analytics`**:  Asegurarse de que las políticas RLS definidas en `create_analytics_partition()` cumplen con los requisitos de seguridad y acceso deseados.  Documentar el propósito de cada política RLS.
+--  3. **Consistencia en nombres de índices de particiones de analytics**:  En `init_4.sql`, los nombres de índices de particiones `vector_analytics` usaban un sufijo de timestamp (`unique_suffix`). En `init_5.sql`, los nombres de índices de particiones `analytics` *también* usan un sufijo de timestamp, pero *además* hay índices básicos creados *sin* sufijo (`EXECUTE format('CREATE INDEX %I ON app.%I (user_id, created_at)', partition_name || '_user_idx' ...`).  **Recomendación**:  Mantener la consistencia. Decidir si usar siempre sufijos de timestamp en *todos* los índices de particiones (tanto vectoriales como no vectoriales) o no usarlos en ninguno (y asegurar nombres base únicos por tipo de índice dentro de cada partición).  La consistencia facilita el mantenimiento.  Actualmente, la mezcla de ambos estilos puede ser confusa.
+
+-- PRÓXIMO PASO:
+--  Por favor, proporcione el siguiente archivo, `init_6.sql`, para continuar el análisis secuencial y verificar la consistencia en toda la secuencia de scripts de inicialización. `init_5.sql` es un script bien estructurado con mejoras significativas en seguridad (RLS en analytics). La principal área de mejora sigue siendo la limpieza de comandos DROP redundantes y la consistencia en el nombrado de índices de particiones.

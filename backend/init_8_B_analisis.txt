@@ -1,0 +1,252 @@
+-- Análisis del archivo init_8.sql - Políticas RLS (Row Level Security)
+
+-- ==============================================
+-- ARCHIVO: init_8.sql - Políticas RLS (Row Level Security) - ANÁLISIS
+-- ==============================================
+-- Resumen del Propósito:
+-- El archivo init_8.sql implementa políticas de seguridad a nivel de fila (RLS) para controlar el acceso a los datos basados en roles y propiedad.
+-- Cubre la limpieza de políticas existentes, la habilitación de RLS en tablas y la definición de políticas para diferentes tipos de tablas.
+
+-- ---------- SECCIÓN 1: LIMPIEZA DE POLÍTICAS ANTIGUAS - ANÁLISIS ----------
+-- OK: Función `drop_all_policies()` para eliminar todas las políticas existentes en esquemas 'public' y 'app'.
+--  **OK**:  Función bien implementada para eliminar políticas de forma iterativa.  Utiliza un cursor para recorrer todas las políticas en los esquemas 'public' y 'app', construye sentencias `DROP POLICY IF EXISTS` dinámicamente y las ejecuta.  Manejo de excepciones (`BEGIN...EXCEPTION WHEN OTHERS THEN RAISE WARNING...END;`) dentro del bucle es adecuado para no interrumpir la limpieza si alguna eliminación falla.  El uso de `format('DROP POLICY IF EXISTS %I ON %I.%I', ...)` con `%I` (identifier quoting) es seguro para evitar problemas con nombres de políticas, esquemas o tablas.
+
+-- ---------- SECCIÓN 2: HABILITAR RLS EN TODAS LAS TABLAS - ANÁLISIS ----------
+-- OK: Funciones `enable_rls_public_tables()`, `enable_rls_app_tables()`, `enable_rls_partitioned_tables()` para habilitar RLS en las tablas correspondientes.
+--  **OK**:  Funciones bien estructuradas que iteran sobre listas de tablas, verifican la existencia de cada tabla (`information_schema.tables`), y luego ejecutan `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`.  Manejo de excepciones (`BEGIN...EXCEPTION WHEN OTHERS THEN RAISE WARNING...END;`) y avisos si la tabla no existe son adecuados.  Separación por esquemas y para tablas particionadas es bien organizado.  Lists of tables seem comprehensive based on previous file reviews.
+
+-- ---------- SECCIÓN 3: POLÍTICAS PARA TABLAS DE USUARIOS Y CONFIGURACIÓN - ANÁLISIS ----------
+-- OK: Políticas para `app.users`, `app.user_config`, `app.subscription_plan_config`, `app.system_config`.
+--  **OK: `user_select_policy` on `app.users`**: Permite SELECT para:
+--    - Usuario propio (`auth.uid() = auth_id`).
+--    - Usuarios públicos activos (`username IS NOT NULL AND deleted_at IS NULL`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_users` permission (`has_permission(..., 'view_users')`).
+--  **OK: `user_modify_policy` on `app.users`**: Permite UPDATE para:
+--    - Usuario propio (`auth.uid() = auth_id`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_users` permission (`has_permission(..., 'manage_users')`).
+--  **OK: `user_delete_policy` on `app.users`**: Permite DELETE para:
+--    - Admins (`is_admin(...)`).
+--    - Usuario propio (`auth.uid() = auth_id`).
+--  **OK: `user_config_select_policy` on `app.user_config`**: Permite SELECT para:
+--    - Configuración propia (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_user_configs` permission (`has_permission(..., 'manage_user_configs')`).
+--  **OK: `user_config_modify_policy` on `app.user_config`**: Permite ALL (INSERT, UPDATE, DELETE) for:
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_user_configs` permission (`has_permission(..., 'manage_user_configs')`).
+--  **OK: `subscription_plan_config_select_policy` on `app.subscription_plan_config`**: Permite SELECT para ALL (`TRUE`). Publicly visible plan info.
+--  **OK: `subscription_plan_config_modify_policy` on `app.subscription_plan_config`**: Permite ALL for:
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_subscription_configs` permission (`has_permission(..., 'manage_subscription_configs')`).
+--  **OK: `system_config_select_policy` on `app.system_config`**: Permite SELECT for ALL (`TRUE`). Publicly visible system config.
+--  **OK: `system_config_modify_policy` on `app.system_config`**: Permite ALL for:
+--    - Admins (`is_admin(...)`). Only admins can modify system config.
+-- Policies in this section seem correct and well-defined, implementing role-based and ownership-based access control for user and configuration data.
+
+-- ---------- SECCIÓN 4: POLÍTICAS PARA ROLES Y SUSCRIPCIONES - ANÁLISIS ----------
+-- OK: Políticas para `app.user_roles`, `app.user_role_history`, `app.subscriptions`, `app.subscription_history`.
+--  **OK: `user_roles_select_policy` on `app.user_roles`**: Permite SELECT para:
+--    - Roles propios (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_users` permission (`has_permission(..., 'manage_users')`).
+--  **OK: `user_roles_modify_policy` on `app.user_roles`**: Permite ALL for:
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_users` permission (`has_permission(..., 'manage_users')`).
+--  **OK: `user_role_history_select_policy` on `app.user_role_history`**: Permite SELECT para:
+--    - Historial propio (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_user_history` permission (`has_permission(..., 'view_user_history')`).
+--  **OK: `subscriptions_select_policy` on `app.subscriptions`**: Permite SELECT for:
+--    - Suscripción propia (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_subscriptions` permission (`has_permission(..., 'view_subscriptions')`).
+--  **OK: `subscriptions_modify_policy` on `app.subscriptions`**: Permite ALL for:
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_subscriptions` permission (`has_permission(..., 'manage_subscriptions')`).
+--  **OK: `subscription_history_select_policy` on `app.subscription_history`**: Permite SELECT for:
+--    - Historial propio (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_subscription_history` permission (`has_permission(..., 'view_subscription_history')`).
+-- Policies in this section correctly implement access control for roles and subscription related data, following ownership and role-based access patterns.
+
+-- ---------- SECCIÓN 5: POLÍTICAS PARA PERFILES Y TEMAS - ANÁLISIS ----------
+-- OK: Políticas para `public.profiles`, `public.themes`.
+--  **OK: `profile_select_policy` on `public.profiles`**: Permite SELECT for:
+--    - Perfil propio o público (`id IN (SELECT id ... WHERE auth.uid() = auth_id OR (username IS NOT NULL AND deleted_at IS NULL))`). Allows access to own profile and public profiles (username set and not deleted).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_profiles` permission (`has_permission(..., 'view_profiles')`).
+--  **OK: `profile_modify_policy` on `public.profiles`**: Permite ALL for:
+--    - Perfil propio (`id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_profiles` permission (`has_permission(..., 'manage_profiles')`).
+--  **OK: `themes_select_policy` on `public.themes`**: Permite SELECT for ALL (`TRUE`). Publicly accessible themes.
+--  **OK: `themes_modify_policy` on `public.themes`**: Permite ALL for:
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_themes` permission (`has_permission(..., 'manage_themes')`).
+-- Policies in this section correctly handle access to profiles and themes, considering public visibility and user ownership.
+
+-- ---------- SECCIÓN 6: POLÍTICAS PARA ENLACES Y GRUPOS - ANÁLISIS ----------
+-- OK: Políticas para `public.links`, `public.link_groups`, `public.link_group_items`.
+--  **OK: `link_select_policy` on `public.links`**: Permite SELECT for:
+--    - Active public links (`is_active = TRUE`).
+--    - Enlaces propios (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--  **OK: `link_modify_policy` on `public.links`**: Permite ALL for:
+--    - Enlaces propios (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_links` permission (`has_permission(..., 'manage_links')`).
+--  **OK: `link_groups_select_policy` on `public.link_groups`**: Permite SELECT for:
+--    - Grupos propios (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--  **OK: `link_groups_modify_policy` on `public.link_groups`**: Permite ALL for:
+--    - Grupos propios (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_links` permission (`has_permission(..., 'manage_links')`).
+--  **OK: `link_group_items_select_policy` on `public.link_group_items`**: Permite SELECT for:
+--    - Elementos en grupos propios (`group_id IN (SELECT id FROM public.link_groups WHERE user_id IN (SELECT id ... WHERE auth.uid() = auth_id))`).
+--    - Admins (`is_admin(...)`).
+--  **OK: `link_group_items_modify_policy` on `public.link_group_items`**: Permite ALL for:
+--    - Elementos en grupos propios (`group_id IN (SELECT id FROM public.link_groups WHERE user_id IN (SELECT id ... WHERE auth.uid() = auth_id))`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_links` permission (`has_permission(..., 'manage_links')`).
+-- Policies for links and link groups correctly enforce ownership and public visibility for links.
+
+-- ---------- SECCIÓN 7: POLÍTICAS PARA TABLAS RAG - ANÁLISIS ----------
+-- OK: Políticas for RAG related tables (`public.bots`, `app.document_collections`, `app.documents`, `app.document_chunks`, `app.bot_collections`).
+--  **OK: `bots_select_policy` on `public.bots`**: Permite SELECT for:
+--    - Bots propios (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id) AND deleted_at IS NULL`).
+--    - Bots linked and active (`id IN (SELECT bot_id FROM public.links WHERE is_active = TRUE) AND deleted_at IS NULL`).
+--    - Public bots (`is_public = TRUE AND deleted_at IS NULL`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_bots` permission (`has_permission(..., 'view_bots')`).
+--  **OK: `bots_modify_policy` on `public.bots`**: Permite ALL for:
+--    - Bots propios (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_bots` permission (`has_permission(..., 'manage_bots')`).
+--  **OK: `collections_select_policy` on `app.document_collections`**: Permite SELECT for:
+--    - Colecciones propias (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id) AND deleted_at IS NULL`).
+--    - Public collections (`is_public = TRUE AND deleted_at IS NULL`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_collections` permission (`has_permission(..., 'view_collections')`).
+--  **OK: `collections_modify_policy` on `app.document_collections`**: Permite ALL for:
+--    - Colecciones propias (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_collections` permission (`has_permission(..., 'manage_collections')`).
+--  **OK: `documents_select_policy` on `app.documents`**: Permite SELECT for:
+--    - Documentos in own collections (`collection_id IN (...) AND deleted_at IS NULL`).
+--    - Documentos in public collections (`collection_id IN (...) AND deleted_at IS NULL`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_documents` permission (`has_permission(..., 'view_documents')`).
+--  **OK: `documents_modify_policy` on `app.documents`**: Permite ALL for:
+--    - Documentos in own collections (`collection_id IN (...) AND deleted_at IS NULL`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_documents` permission (`has_permission(..., 'manage_documents')`).
+--  **OK: `chunks_select_policy` on `app.document_chunks`**: Permite SELECT for:
+--    - Chunks in own documents/collections (complex nested condition).
+--    - Chunks in public documents/collections (complex nested condition).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_document_chunks` permission (`has_permission(..., 'view_document_chunks')`).
+--  **OK: `chunks_modify_policy` on `app.document_chunks`**: Permite ALL for:
+--    - Chunks in own documents/collections (complex nested condition).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_document_chunks` permission (`has_permission(..., 'manage_document_chunks')`).
+--  **OK: `bot_collections_select_policy` on `app.bot_collections`**: Permite SELECT for:
+--    - Relations with own bots (`bot_id IN (...) AND deleted_at IS NULL`).
+--    - Relations with own collections (`collection_id IN (...) AND deleted_at IS NULL`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_bot_collections` permission (`has_permission(..., 'view_bot_collections')`).
+--  **OK: `bot_collections_modify_policy` on `app.bot_collections`**: Permite ALL for:
+--    - Relations with own bots (`bot_id IN (...) AND deleted_at IS NULL`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_bot_collections` permission (`has_permission(..., 'manage_bot_collections')`).
+-- Policies for RAG tables effectively control access based on ownership, public visibility, and administrative roles. Nested conditions for documents and chunks accurately reflect the relationship with collections.
+
+-- ---------- SECCIÓN 8: POLÍTICAS PARA CONVERSACIONES Y MENSAJES - ANÁLISIS ----------
+-- OK: Policies for `public.conversations`, `public.messages`, `app.bot_response_feedback`.
+--  **OK: `conversations_select_policy` on `public.conversations`**: Permite SELECT for:
+--    - Own conversations (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Public conversations (`is_public = TRUE`).
+--    - Conversations with public bots (`bot_id IN (SELECT id FROM public.bots WHERE is_public = TRUE)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_conversations` permission (`has_permission(..., 'view_conversations')`).
+--  **OK: `conversations_insert_policy` on `public.conversations`**: Permite INSERT WITH CHECK for:
+--    - Own conversations (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Conversations with public bots (`bot_id IN (SELECT id FROM public.bots WHERE is_public = TRUE)`).
+--    - Conversations with linked bots (`bot_id IN (SELECT bot_id FROM public.links WHERE is_active = TRUE)`). Allows visitors to start conversations with public/linked bots.
+--  **OK: `conversations_update_policy` on `public.conversations`**: Permite UPDATE for:
+--    - Own conversations (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_conversations` permission (`has_permission(..., 'manage_conversations')`). No DELETE policy defined explicitly, assuming DELETE is restricted by default or handled differently (soft delete perhaps).
+--  **OK: `messages_select_policy` on `public.messages`**: Permite SELECT for:
+--    - Messages in own/public conversations or conversations with public bots (nested condition based on `conversation_id`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_messages` permission (`has_permission(..., 'view_messages')`).
+--  **OK: `messages_insert_policy` on `public.messages`**: Permite INSERT WITH CHECK for:
+--    - Messages in own conversations, conversations with public bots, or linked bots (nested condition based on `conversation_id`). Allows visitors to send messages in conversations with public/linked bots. No UPDATE or DELETE policy defined explicitly, assuming restricted by default.
+--  **OK: `feedback_select_policy` on `app.bot_response_feedback`**: Permite SELECT for:
+--    - Own feedback (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Feedback on own bots (complex nested condition based on `message_id`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_feedback` permission (`has_permission(..., 'view_feedback')`).
+--  **OK: `feedback_insert_policy` on `app.bot_response_feedback`**: Permite INSERT WITH CHECK for:
+--    - Feedback on public/linked bots (nested condition based on `message_id`).
+--    - Feedback from authenticated users (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).  Allows visitors to give feedback on public/linked bot responses and authenticated users to provide feedback generally. No UPDATE or DELETE policies, assume restricted.
+-- Policies for conversations, messages and feedback are well-defined, considering public bot access and user ownership for conversation data.
+
+-- ---------- SECCIÓN 9: POLÍTICAS PARA ANALYTICS Y MONITOREO - ANÁLISIS ----------
+-- OK: Policies for analytics and monitoring tables (`app.analytics`, `app.vector_analytics`, `app.system_errors`, `app.usage_metrics`, `app.quota_notifications`).
+--  **OK: `analytics_select_policy` on `app.analytics`**: Permite SELECT for:
+--    - Own analytics (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_analytics` permission (`has_permission(..., 'view_analytics')`).
+--  **OK: `analytics_insert_policy` on `app.analytics`**: Permite INSERT WITH CHECK for:
+--    - Real users (`user_id IN (SELECT id FROM app.users)`). Prevents anonymous or system inserts.
+--  **OK: `vector_analytics_select_policy` on `app.vector_analytics`**: Permite SELECT for:
+--    - Own analytics, analytics for own bots (nested condition based on `bot_id`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_analytics` permission (`has_permission(..., 'view_analytics')`).
+--  **OK: `vector_analytics_insert_policy` on `app.vector_analytics`**: Permite INSERT WITH CHECK for:
+--    - Own analytics, analytics for public/linked bots (nested condition based on `bot_id`).
+--  **OK: `system_errors_select_policy` on `app.system_errors`**: Permite SELECT for:
+--    - Own errors (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_system_logs` permission (`has_permission(..., 'view_system_logs')`).
+--  **OK: `system_errors_update_policy` on `app.system_errors`**: Permite UPDATE for:
+--    - Admins (`is_admin(...)`).
+--    - Users with `manage_system_logs` permission (`has_permission(..., 'manage_system_logs')`). No INSERT/DELETE policy defined, assume restricted by default.
+--  **OK: `usage_metrics_select_policy` on `app.usage_metrics`**: Permite SELECT for:
+--    - Own metrics (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--    - Users with `view_usage_metrics` permission (`has_permission(..., 'view_usage_metrics')`). No INSERT/UPDATE/DELETE policies defined, assume restricted.
+--  **OK: `quota_notifications_select_policy` on `app.quota_notifications`**: Permite SELECT for:
+--    - Own notifications (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`).
+--  **OK: `quota_notifications_modify_policy` on `app.quota_notifications`**: Permite UPDATE for:
+--    - Own notifications (`user_id IN (SELECT id ... WHERE auth.uid() = auth_id)`).
+--    - Admins (`is_admin(...)`). No INSERT/DELETE policies defined, assume restricted.
+-- Policies for analytics and monitoring are correctly restricted to authorized users and admins, with insert policies for analytics data generation.
+
+-- ---------- SECCIÓN 10: POLÍTICAS PARA PARTICIONES DE ANALYTICS - ANÁLISIS ----------
+-- OK: Function `apply_analytics_partition_policies()` to apply RLS policies to analytics partitions.
+--  **OK**: Function `apply_analytics_partition_policies()` iterates over analytics partitions, checks for policy existence (`pg_policies`), and creates `analytics_partition_select_policy` and `analytics_partition_insert_policy` for each partition if they don't exist.  Policies are similar to `analytics_select_policy` and `analytics_insert_policy` but applied to individual partition tables. This ensures that RLS policies are applied to new partitions automatically.
+
+-- ==============================================
+-- RESUMEN GENERAL DEL ARCHIVO init_8.sql - INCONSISTENCIAS Y SUGERENCIAS
+-- ==============================================
+-- INCONSISTENCIAS Y SUGERENCIAS:
+--  1. **No Initial Admin User Creation**: The file description section 8 mentions "Crea un usuario administrador inicial si no existe" (Creates an initial admin user if not exists), but **there is no code in `init_8.sql` to create an initial admin user.**  **RECOMENDACIÓN: If an initial admin user creation is intended in this script, add a section (e.g., section 11) to check if an admin user exists and create one if not. This might involve checking for users with the 'admin' role in `app.user_roles` and inserting a default admin user if none exists.** If the initial admin user creation is handled in a separate process or script, update the file description to reflect this.
+--  2. **Redundancy in Permission Checks**: Many policies repeat the pattern `is_admin(...) OR has_permission(...)`. While functionally correct, this could be slightly simplified and potentially improved in performance if these checks were consolidated into reusable functions (though the current approach is very explicit and readable). **No strong recommendation for change, but consider if reusable permission check functions could enhance maintainability for very large sets of policies.**
+--  3. **Implicit DELETE/UPDATE Restrictions**: For several tables (e.g., `conversations`, `messages`, `system_errors`, `usage_metrics`, `quota_notifications`), UPDATE and DELETE policies are not explicitly defined. RLS defaults to DENY if no explicit policy allows an operation. **While this might be the intended secure default, it's best practice to explicitly define DELETE and UPDATE policies as needed, even if they are DENY ALL policies, to make the security intent clear and auditable.**  **RECOMENDACIÓN: Review each table and explicitly define DELETE and UPDATE policies (even if they are `FOR DELETE USING (FALSE);` to explicitly DENY) to ensure clarity about allowed operations and security posture.**
+
+-- PUNTOS FUERTES:
+--  - **Comprehensive RLS Implementation**: Implements RLS policies for almost all tables in the system, covering a wide range of access control scenarios.
+--  - **Well-Structured and Modular**:  Script is well-structured into logical sections with clear function definitions for cleanup and enabling RLS.
+--  - **Secure and Principle of Least Privilege**: Policies generally follow the principle of least privilege, granting access based on ownership, administrative roles, and specific permissions.
+--  - **Robust Error Handling**: Includes error handling for policy deletion and RLS enabling, preventing script failures.
+--  - **Clear Naming Conventions**: Uses clear and consistent naming conventions for policies (e.g., `table_operation_policy`).
+--  - **Dynamic Policy Application to Partitions**: `apply_analytics_partition_policies()` function correctly handles RLS policy application to partitioned tables.
+
+-- PRÓXIMO PASO:
+--  Please provide the next file, `init_9.sql`, to continue the analysis of the initialization script sequence. `init_8.sql` is a very well-written and comprehensive script for implementing Row Level Security policies.  The main points for improvement are adding initial admin user creation if intended, considering reusable permission check functions for potential maintainability improvements, and explicitly defining DELETE/UPDATE policies where they are currently implicit DENY to enhance clarity and auditability of the security configuration. The RLS policies are generally well-designed and provide a strong foundation for data security.

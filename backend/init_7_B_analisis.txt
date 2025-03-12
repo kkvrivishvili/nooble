@@ -1,0 +1,86 @@
+-- Análisis del archivo init_7.sql - Creación de Triggers e Índices
+
+-- ==============================================
+-- ARCHIVO: init_7.sql - Creación de Triggers e Índices - ANÁLISIS
+-- ==============================================
+-- Resumen del Propósito:
+-- El archivo init_7.sql configura triggers y índices para asegurar la integridad, consistencia y rendimiento de la base de datos.
+-- Se enfoca en la creación de triggers para timestamps, contadores, cuotas, particionamiento, e índices para optimización de consultas,
+-- búsqueda textual y vectorial.
+
+-- ---------- SECCIÓN 1: LIMPIEZA SEGURA DE TRIGGERS EXISTENTES - ANÁLISIS ----------
+-- OK: Limpieza segura de triggers existentes mediante un bucle iterativo y sentencias `DROP TRIGGER IF EXISTS`.
+--  **OK**:  El bloque `DO $$ DECLARE ... LOOP ... END LOOP; END $$;` itera sobre los triggers existentes en los esquemas 'public' y 'app', construye dinámicamente sentencias `DROP TRIGGER IF EXISTS`, y las ejecuta.  El uso de `quote_ident` para nombres de esquema, tabla y trigger previene problemas con nombres que contienen caracteres especiales o palabras reservadas.  El manejo de excepciones (`BEGIN...EXCEPTION WHEN OTHERS THEN RAISE WARNING...END;`) dentro del bucle es adecuado para continuar la eliminación de otros triggers incluso si uno falla.  Este enfoque es robusto y seguro para la limpieza de triggers.
+
+-- ---------- SECCIÓN 2: TRIGGERS DE ACTUALIZACIÓN DE TIMESTAMP - ANÁLISIS ----------
+-- OK: Creación de triggers `BEFORE UPDATE` para actualizar automáticamente la columna `updated_at` en las tablas relevantes.
+--  **OK**:  Se crean triggers para todas las tablas relevantes en los esquemas 'app' y 'public' que deberían tener la funcionalidad de `updated_at` automático.  El uso de la función `update_modified_column()` (definida en `init_6.sql`) como procedimiento de trigger es correcto y consistente.  La nomenclatura de los triggers (`update_[TableName]_timestamp`) es clara y consistente.
+
+-- ---------- SECCIÓN 3: TRIGGERS FUNCIONALES - ANÁLISIS ----------
+-- OK: Creación del trigger `increment_clicks_on_analytics` para incrementar el contador de clics en enlaces.
+--  **OK**:  Trigger `AFTER INSERT ON app.analytics FOR EACH ROW WHEN (NEW.link_id IS NOT NULL) EXECUTE PROCEDURE increment_link_clicks();` se dispara correctamente después de insertar un nuevo registro en `app.analytics` con un `link_id` no nulo, e invoca la función `increment_link_clicks()` (definida en `init_6.sql`).  Esto implementa la lógica para actualizar el contador de clics de enlaces basada en la inserción de registros analíticos.
+-- OK: Creación del trigger `update_conversation_activity` para actualizar el timestamp de última actividad en conversaciones.
+--  **OK**:  Trigger `AFTER INSERT ON public.messages FOR EACH ROW EXECUTE PROCEDURE update_conversation_last_activity();` se dispara correctamente después de insertar un nuevo mensaje en `public.messages` e invoca `update_conversation_last_activity()` (definida en `init_6.sql`, aunque no se muestra en el `init_6.sql` proporcionado previously - **verify `update_conversation_last_activity()` function existence, potentially in `init_6.sql` or earlier scripts**).  Esto mantiene actualizado el campo `last_activity_at` en las conversaciones.
+
+-- ---------- SECCIÓN 4: TRIGGERS DE CONTROL DE CUOTAS - ANÁLISIS ----------
+-- OK: Creación de triggers para validación de cuotas (`check_bot_quota`, `check_collection_quota`, `check_document_quota`, `check_vector_search_quota`).
+--  **OK**:  Se crean triggers `BEFORE INSERT` en las tablas correspondientes (`public.bots`, `app.document_collections`, `app.documents`, `app.vector_analytics`) para invocar las funciones `enforce_*_quota()` (definidas in `init_6.sql`) antes de la inserción de nuevos registros.  Las condiciones `WHEN (NEW.deleted_at IS NULL)` en los triggers para bots, collections y documents aseguran que las verificaciones de cuota solo se apliquen para la creación de registros activos (no para re-activación de registros no-deleted, if applicable).  Esto implementa el control de cuotas para diferentes tipos de recursos.
+
+-- ---------- SECCIÓN 5: TRIGGERS DE PARTICIONAMIENTO AUTOMÁTICO - ANÁLISIS ----------
+-- OK: Creación de triggers para particionamiento automático (`create_analytics_partition_trigger`, `create_vector_analytics_partition_trigger`).
+--  **OK**:  Triggers `BEFORE INSERT` en las tablas particionadas `app.analytics` y `app.vector_analytics` para invocar las funciones `create_*_partition()` (definidas in `init_5.sql` and potentially `init_4.sql`, respectively).  Esto asegura que las particiones mensuales se crean automáticamente antes de la inserción de nuevos datos en estas tablas particionadas.
+-- OK: Creación del trigger `validate_system_config_changes` para validar la configuración del sistema.
+--  **OK**: Trigger `BEFORE INSERT OR UPDATE ON app.system_config FOR EACH ROW EXECUTE PROCEDURE validate_config_changes();` se dispara correctamente antes de insertar o actualizar registros en `app.system_config` e invoca la función `validate_config_changes()` (function `validate_config_changes()` not provided in previous scripts - **verify `validate_config_changes()` function existence, potentially in `init_6.sql` or earlier scripts, or if it is defined later in this file**).  This ensures validation of system configuration changes before they are applied.
+
+-- ---------- SECCIÓN 6: ÍNDICES PARA TABLAS PRINCIPALES - ANÁLISIS ----------
+-- OK: Creación de índices optimizados para tablas principales, incluyendo verificaciones de existencia.
+--  **OK**:  El bloque `DO $$ DECLARE ... IF NOT index_exists THEN CREATE INDEX ... END IF; END $$;` crea índices para varias tablas principales in 'app' and 'public' schemas, checking for index existence before creation to avoid errors on re-execution.  Indices include:
+--  - `idx_users_auth_id` on `app.users(auth_id)` with `WHERE deleted_at IS NULL` - For efficient lookups by `auth_id` for non-deleted users.
+--  - `idx_users_username_search` and `idx_users_email_search` on `app.users` using `gin(username gin_trgm_ops)` and `gin(email gin_trgm_ops)` with `WHERE deleted_at IS NULL` - For efficient username and email search using trigram GIN indexes.
+--  - `idx_links_user_position` and `idx_links_bot_id` on `public.links` - Standard B-tree indexes for filtering and ordering.
+--  - `idx_links_active` on `public.links(user_id) WHERE is_active = TRUE` - Partial index for efficient queries on active links for a user. **Note:** Index `idx_links_active` was previously defined on `public.links(is_active) WHERE is_active = TRUE` in `init_5.sql`, here it's changed to `public.links(user_id) WHERE is_active = TRUE`. **This is a potential inconsistency or intentional change - clarify the intended index for active links.**
+--  - `idx_user_roles_role` on `app.user_roles(role)` - For efficient filtering by user role.
+--  - `idx_system_errors_unresolved` on `app.system_errors(created_at) WHERE is_resolved = FALSE` - Partial index to efficiently query unresolved system errors, ordered by creation time.
+--  - `idx_system_errors_type_severity` on `app.system_errors(error_type, severity)` - For efficient filtering by error type and severity.
+--  - `idx_usage_metrics_user_date` on `app.usage_metrics(user_id, year_month)` - For efficient queries on usage metrics for a user in a specific month.
+--  - `idx_subscriptions_status` on `app.subscriptions(status, current_period_end)` - For efficient queries on subscriptions by status and expiration date.
+--  - `idx_subscriptions_expiring` on `app.subscriptions(current_period_end) WHERE status = 'active' AND auto_renew = FALSE` - Partial index for efficient queries to find expiring subscriptions that are not set to auto-renew.
+--  - `idx_messages_content_search` and `idx_conversations_search` on `public.messages` and `public.conversations` using `gin(content gin_trgm_ops)` and `gin(title gin_trgm_ops)` - For efficient content and title text searches using trigram GIN indexes.
+--  - `idx_conversations_user_activity` on `public.conversations(user_id, last_activity_at DESC)` - For efficient queries to list conversations for a user, ordered by last activity time.
+
+-- ---------- SECCIÓN 7: ÍNDICES PARA DOCUMENTOS Y BÚSQUEDA VECTORIAL - ANÁLISIS ----------
+-- OK: Creación de índices específicos para documentos y perfiles, including text and social handle search indices.
+--  **OK**:  Similar `DO $$ DECLARE ... IF NOT index_exists THEN CREATE INDEX ... END IF; END $$;` block for creating specialized indexes:
+--  - `idx_documents_title_search` and `idx_documents_content_search` on `app.documents` using `gin(title gin_trgm_ops)` and `gin(content gin_trgm_ops)` with `WHERE deleted_at IS NULL` - For efficient title and content text searches in documents.
+--  - `idx_documents_processing_status` on `app.documents(processing_status, updated_at) WHERE deleted_at IS NULL` - Partial index to efficiently query documents by processing status and update time for non-deleted documents.
+--  - `idx_document_chunks_content_search` on `app.document_chunks` using `gin(content gin_trgm_ops)` - For efficient content text search in document chunks.
+--  - `idx_profiles_custom_domain` on `public.profiles(custom_domain) WHERE custom_domain IS NOT NULL` - Partial index for efficient lookup by custom domain.
+--  - `idx_profiles_social_handles` on `public.profiles` using `gin(to_tsvector(...))` - GIN index on combined social handle fields for efficient social handle search.
+--  - `idx_profiles_verified` on `public.profiles(view_count DESC) WHERE is_verified = TRUE` - Partial index for efficient queries of verified profiles, ordered by view count, potentially for featured profiles listing.
+
+-- ---------- SECCIÓN 8: ÍNDICES VECTORIALES - ANÁLISIS ----------
+-- OK: Creación de IVFFlat vector indexes (`idx_document_chunks_vector`, `idx_messages_embedding`, `idx_vector_analytics_vector`).
+--  **OK**:  `DO $$ DECLARE ... IF NOT index_exists ... END IF; END $$;` block to create IVFFlat indexes for vector columns: `content_vector` in `app.document_chunks`, `embedding` in `public.messages`, and `query_vector` in `app.vector_analytics`.  `USING ivfflat ( ... vector_cosine_ops) WITH (lists = 100)` is used, which is appropriate for cosine similarity search on vectors with reasonable performance for approximate nearest neighbor search.  Error handling with `BEGIN...EXCEPTION WHEN OTHERS THEN RAISE WARNING...END;` is in place for each index creation.
+
+-- ---------- SECCIÓN 9: VERIFICACIÓN DE INTEGRIDAD - ANÁLISIS ----------
+-- OK: Final integrity check section that counts triggers and indexes, and provides a summary report.
+--  **OK**:  `DO $$ DECLARE ... RAISE NOTICE ... END $$;` block to count triggers and indexes in 'public' and 'app' schemas and display a summary report.  This provides a useful confirmation of the number of objects created and a high-level summary of completed sections (timestamp triggers, functional triggers, quota triggers, main table indexes, search and vector indexes, analyze).  `ANALYZE;` command at the end of section 8 is correctly placed to update statistics after index creation.
+
+-- ==============================================
+-- RESUMEN GENERAL DEL ARCHIVO init_7.sql - INCONSISTENCIAS Y SUGERENCIAS
+-- ==============================================
+-- INCONSISTENCIAS Y SUGERENCIAS:
+--  1. **Index `idx_links_active` Inconsistency**: As noted in the section 6 analysis, the index `idx_links_active` is defined differently in `init_7.sql` compared to `init_5.sql`.  In `init_5.sql`, it's `CREATE INDEX idx_links_active ON public.links(is_active) WHERE is_active = TRUE;`, while in `init_7.sql`, it's `CREATE INDEX idx_links_active ON public.links(user_id) WHERE is_active = TRUE;`. **RECOMENDACIÓN: Clarify the intended purpose and definition of `idx_links_active`.  If the intention is to optimize queries for active links *per user*, then `public.links(user_id) WHERE is_active = TRUE` is more appropriate. If it's to optimize queries for *all* active links, `public.links(is_active) WHERE is_active = TRUE` is better. Choose one definition and ensure consistency.**
+--  2. **Verify Function `update_conversation_last_activity()` Existence**: Section 3 uses `update_conversation_last_activity()`. **Ensure this function is defined in `init_6.sql` or earlier scripts. If not, `init_7.sql` will fail.**  Add a dependency check at the beginning of `init_7.sql` if needed.
+--  3. **Verify Function `validate_config_changes()` Existence**: Section 5 uses `validate_config_changes()`. **Ensure this function is defined in `init_6.sql` or earlier scripts (or later in `init_7.sql` itself if it's a multi-part file - review the full file to confirm). If not, `init_7.sql` will fail.** Add a dependency check if needed.
+--  4. **Redundant Trigger and Index Cleaning Sections**: The script includes sections to "LIMPIEZA SEGURA DE TRIGGERS EXISTENTES" and "Eliminar índices para evitar conflictos" in `init_5.sql`. While safe, having these cleanup sections in *multiple* init files could be slightly redundant.  For a full re-initialization, cleaning at the beginning of the first init file and then just `DROP IF EXISTS` before CREATE in subsequent files might be cleaner.  However, the current approach of safe cleanup in multiple files is also valid for incremental runs of specific scripts, so it's a design choice. **No strong recommendation for change here, but consider the overall initialization strategy and potential redundancy.**
+
+-- PUNTOS FUERTES:
+--  - **Robust Trigger and Index Creation**: The script robustly creates triggers and indexes, handling pre-existence and potential errors gracefully.
+--  - **Comprehensive Set of Triggers and Indexes**:  Implements a comprehensive set of triggers for timestamp management, functional logic (click counting, conversation activity), quota enforcement, and partitioning.  Creates a good range of indexes for performance optimization, covering main tables, text search, social handle search, and vector search.
+--  - **Optimized Index Types**:  Uses appropriate index types for different use cases (B-tree, GIN with `gin_trgm_ops`, IVFFlat with `vector_cosine_ops`).
+--  - **Integrity Verification**: Includes a final integrity check and summary report, confirming the successful creation of objects.
+--  - **Clear Structure and Comments**: Well-structured into logical sections with clear comments explaining the purpose of each section and individual triggers/indexes.
+
+-- PRÓXIMO PASO:
+--  Please provide the next file, `init_8.sql`, to continue the analysis of the initialization script sequence.  `init_7.sql` is a very well-structured and comprehensive script for trigger and index creation.  The main points are to clarify the intended definition of `idx_links_active`, and verify the existence of the assumed functions (`update_conversation_last_activity()`, `validate_config_changes()`, and potentially `get_config_int()` and `get_vector_dimension()` if not yet confirmed in earlier files).  The script is generally well-written and contributes significantly to the database's functionality and performance.
