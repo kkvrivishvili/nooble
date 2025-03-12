@@ -15,6 +15,14 @@
 -- Las demás tablas contienen información sensible de permisos, roles y pagos.
 -- ==============================================
 
+-- Verificar que la tabla users existe antes de continuar
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'users') THEN
+        RAISE EXCEPTION 'La tabla app.users no existe. Por favor, ejecute init_2.sql primero.';
+    END IF;
+END $$;
+
 -- Eliminar tablas para recrearlas desde cero
 DROP TABLE IF EXISTS profiles CASCADE;
 DROP TABLE IF EXISTS public.profiles CASCADE;
@@ -180,6 +188,14 @@ COMMENT ON COLUMN app.user_role_history.reason IS 'Motivo del cambio de rol';
 
 -- ---------- SECCIÓN 3: SUSCRIPCIONES Y PAGOS ----------
 
+-- Verificar existencia de tabla system_config
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'system_config') THEN
+    RAISE WARNING 'La tabla app.system_config no existe. Algunas referencias podrían fallar.';
+  END IF;
+END $$;
+
 -- Tabla mejorada de Suscripciones (interna)
 CREATE TABLE IF NOT EXISTS app.subscriptions (
   id UUID PRIMARY KEY DEFAULT extensions.uuid_generate_v4(),
@@ -281,12 +297,48 @@ COMMENT ON COLUMN app.subscription_history.created_by IS 'Usuario que realizó e
 
 -- ---------- SECCIÓN 4: TRIGGERS Y FUNCIONES ----------
 
+-- Verificar existencia de tabla user_config
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'user_config') THEN
+    RAISE WARNING 'La tabla app.user_config no existe. La función sync_user_config_on_subscription_change podría fallar.';
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'subscription_plan_config') THEN
+    RAISE WARNING 'La tabla app.subscription_plan_config no existe. La función sync_user_config_on_subscription_change podría fallar.';
+  END IF;
+END $$;
+
 -- Trigger para sincronizar configuración al cambiar suscripción
 CREATE OR REPLACE FUNCTION sync_user_config_on_subscription_change()
 RETURNS TRIGGER AS $$
 DECLARE
   v_bot_enabled BOOLEAN;
+  v_system_config_exists BOOLEAN;
+  v_user_config_exists BOOLEAN;
+  v_subscription_plan_config_exists BOOLEAN;
 BEGIN
+  -- Verificar dependencias
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables 
+    WHERE table_schema = 'app' AND table_name = 'system_config'
+  ) INTO v_system_config_exists;
+  
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables 
+    WHERE table_schema = 'app' AND table_name = 'user_config'
+  ) INTO v_user_config_exists;
+  
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables 
+    WHERE table_schema = 'app' AND table_name = 'subscription_plan_config'
+  ) INTO v_subscription_plan_config_exists;
+  
+  IF NOT (v_system_config_exists AND v_user_config_exists AND v_subscription_plan_config_exists) THEN
+    RAISE WARNING 'Tablas necesarias no existen. Omitiendo sincronización de configuración.';
+    RETURN NEW;
+  END IF;
+
   -- Registrar cambio en el historial si es relevante
   IF (NEW.plan_type != OLD.plan_type OR NEW.status != OLD.status) THEN
     INSERT INTO app.subscription_history (
@@ -311,27 +363,35 @@ BEGIN
     -- Si el plan es activo, sincronizar configuraciones
     IF NEW.status = 'active' THEN
       -- Insertar configuraciones de nuevo plan que no existan
-      INSERT INTO app.user_config (user_id, config_key, value, override_reason)
-      SELECT 
-        NEW.user_id, 
-        spc.config_key, 
-        spc.value, 
-        'Auto-configurado por cambio de plan a ' || NEW.plan_type
-      FROM app.subscription_plan_config spc
-      WHERE spc.plan_type = NEW.plan_type
-      ON CONFLICT (user_id, config_key) DO NOTHING;
+      BEGIN
+        INSERT INTO app.user_config (user_id, config_key, value, override_reason)
+        SELECT 
+          NEW.user_id, 
+          spc.config_key, 
+          spc.value, 
+          'Auto-configurado por cambio de plan a ' || NEW.plan_type
+        FROM app.subscription_plan_config spc
+        WHERE spc.plan_type = NEW.plan_type
+        ON CONFLICT (user_id, config_key) DO NOTHING;
+      EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Error al sincronizar configuraciones: %', SQLERRM;
+      END;
       
       -- Verificar si el plan actual permite chatbots públicos
-      SELECT (value = 'true') INTO v_bot_enabled
-      FROM app.subscription_plan_config 
-      WHERE plan_type = NEW.plan_type AND config_key = 'enable_public_chat';
-      
-      -- Actualizar perfil con la nueva configuración de chatbot
-      IF v_bot_enabled IS NOT NULL THEN
-        UPDATE public.profiles
-        SET enable_public_chat = v_bot_enabled
-        WHERE id = NEW.user_id;
-      END IF;
+      BEGIN
+        SELECT (value = 'true') INTO v_bot_enabled
+        FROM app.subscription_plan_config 
+        WHERE plan_type = NEW.plan_type AND config_key = 'enable_public_chat';
+        
+        -- Actualizar perfil con la nueva configuración de chatbot
+        IF v_bot_enabled IS NOT NULL THEN
+          UPDATE public.profiles
+          SET enable_public_chat = v_bot_enabled
+          WHERE id = NEW.user_id;
+        END IF;
+      EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Error al actualizar configuración de chat: %', SQLERRM;
+      END;
     END IF;
   END IF;
   
@@ -404,7 +464,7 @@ BEGIN
   LOOP
     -- Comprobar si el username ya existe
     SELECT EXISTS (
-      SELECT 1 FROM app.users WHERE username = candidate_username
+      SELECT 1 FROM app.users WHERE username = candidate_username AND deleted_at IS NULL
     ) INTO username_exists;
     
     -- Si no existe o hemos intentado demasiadas veces, salir del bucle
@@ -426,7 +486,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, app, extensions;
 
 -- Función para manejar nuevos usuarios cuando se registran en auth
 CREATE OR REPLACE FUNCTION handle_new_user()
-RETURNS TRIGGER SECURITY DEFINER AS $$
+RETURNS TRIGGER AS $$
 DECLARE
   default_theme_id UUID;
   user_id UUID;
@@ -435,11 +495,48 @@ DECLARE
   generated_username TEXT;
   current_date TIMESTAMP WITH TIME ZONE := NOW();
   period_end TIMESTAMP WITH TIME ZONE;
+  
+  -- Variables para verificación de tablas
+  v_themes_exist BOOLEAN;
+  v_profiles_exist BOOLEAN;
+  v_user_roles_exist BOOLEAN;
+  v_links_exist BOOLEAN;
+  v_subscriptions_exist BOOLEAN;
+  v_log_system_error_exists BOOLEAN;
 BEGIN
+  -- Verificar existencia de tablas dependientes
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'themes'
+  ) INTO v_themes_exist;
+  
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'profiles'
+  ) INTO v_profiles_exist;
+  
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'user_roles'
+  ) INTO v_user_roles_exist;
+  
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'links'
+  ) INTO v_links_exist;
+  
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'subscriptions'
+  ) INTO v_subscriptions_exist;
+  
+  -- Verificar si la función log_system_error existe
+  SELECT EXISTS (
+    SELECT 1 FROM pg_proc
+    WHERE proname = 'log_system_error' AND pg_function_is_visible(oid)
+  ) INTO v_log_system_error_exists;
+  
   -- Obtener ID de tema por defecto (usamos el primero, normalmente 'Default')
-  SELECT id INTO default_theme_id FROM public.themes WHERE name = 'Default';
-  IF default_theme_id IS NULL THEN
-    SELECT id INTO default_theme_id FROM public.themes LIMIT 1;
+  IF v_themes_exist THEN
+    SELECT id INTO default_theme_id FROM public.themes WHERE name = 'Default';
+    IF default_theme_id IS NULL THEN
+      SELECT id INTO default_theme_id FROM public.themes LIMIT 1;
+    END IF;
   END IF;
   
   -- Extraer información de metadatos si están disponibles
@@ -459,7 +556,7 @@ BEGIN
     END IF;
     
     -- Verificar si ya existe
-    IF EXISTS (SELECT 1 FROM app.users WHERE username = generated_username) THEN
+    IF EXISTS (SELECT 1 FROM app.users WHERE username = generated_username AND deleted_at IS NULL) THEN
       generated_username := generate_unique_username(NEW.email);
     END IF;
   END IF;
@@ -482,127 +579,135 @@ BEGIN
   )
   RETURNING id INTO user_id;
   
-  -- Insertar en la tabla profiles
-  INSERT INTO public.profiles (
-    id,
-    meta_title,
-    meta_description,
-    chat_welcome_message
-  ) VALUES (
-    user_id,
-    generated_username || '''s Links',
-    'Check out my links and resources',
-    'Hi! Welcome to my Linktree. Feel free to ask me anything!'
-  );
+  -- Insertar en la tabla profiles si existe
+  IF v_profiles_exist THEN
+    BEGIN
+      INSERT INTO public.profiles (
+        id,
+        meta_title,
+        meta_description,
+        chat_welcome_message
+      ) VALUES (
+        user_id,
+        generated_username || '''s Links',
+        'Check out my links and resources',
+        'Hi! Welcome to my Linktree. Feel free to ask me anything!'
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'Error al crear perfil para el usuario %: %', user_id, SQLERRM;
+    END;
+  END IF;
   
-  -- Insertar en user_roles con rol de usuario estándar
-  INSERT INTO app.user_roles (
-    user_id, 
-    role, 
-    permissions,
-    notes
-  ) VALUES (
-    user_id, 
-    'user', 
-    '{
-      "create_links": true, 
-      "create_bots": true, 
-      "customize_profile": true,
-      "view_own_analytics": true
-    }',
-    'Rol asignado automáticamente durante registro'
-  );
+  -- Insertar en user_roles con rol de usuario estándar si la tabla existe
+  IF v_user_roles_exist THEN
+    BEGIN
+      INSERT INTO app.user_roles (
+        user_id, 
+        role, 
+        permissions,
+        notes
+      ) VALUES (
+        user_id, 
+        'user', 
+        '{
+          "create_links": true, 
+          "create_bots": true, 
+          "customize_profile": true,
+          "view_own_analytics": true
+        }',
+        'Rol asignado automáticamente durante registro'
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'Error al asignar rol al usuario %: %', user_id, SQLERRM;
+    END;
+  END IF;
   
   -- Calcular el período de finalización para la suscripción gratuita (1 año desde ahora)
   period_end := current_date + INTERVAL '1 year';
   
-  -- Crear suscripción gratuita automáticamente
-  INSERT INTO app.subscriptions (
-    user_id,
-    plan_type,
-    status,
-    current_period_start,
-    current_period_end,
-    auto_renew,
-    llm_tokens_included,
-    llm_tokens_reset_date,
-    llm_max_embedding_dimensions,
-    llm_available_models,
-    meta_data
-  ) VALUES (
-    user_id,
-    'free',
-    'active',
-    current_date,
-    period_end,
-    TRUE,
-    100000, -- 100k tokens mensuales gratis
-    current_date + INTERVAL '1 month',
-    1536, -- dimensión estándar para embeddings
-    '["gpt-3.5-turbo"]', -- modelos disponibles para plan gratuito
-    jsonb_build_object(
-      'registration_source', COALESCE(NEW.raw_user_meta_data->>'source', 'direct'),
-      'auto_created', true
-    )
-  );
+  -- Crear suscripción gratuita automáticamente si la tabla existe
+  IF v_subscriptions_exist THEN
+    BEGIN
+      INSERT INTO app.subscriptions (
+        user_id,
+        plan_type,
+        status,
+        current_period_start,
+        current_period_end,
+        auto_renew,
+        llm_tokens_included,
+        llm_tokens_reset_date,
+        llm_max_embedding_dimensions,
+        llm_available_models,
+        meta_data
+      ) VALUES (
+        user_id,
+        'free',
+        'active',
+        current_date,
+        period_end,
+        TRUE,
+        100000, -- 100k tokens mensuales gratis
+        current_date + INTERVAL '1 month',
+        1536, -- dimensión estándar para embeddings
+        '["gpt-3.5-turbo"]', -- modelos disponibles para plan gratuito
+        jsonb_build_object(
+          'registration_source', COALESCE(NEW.raw_user_meta_data->>'source', 'direct'),
+          'auto_created', true
+        )
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'Error al crear suscripción para el usuario %: %', user_id, SQLERRM;
+    END;
+  END IF;
   
   -- Insertar un link inicial de bienvenida si la tabla links existe
-  BEGIN
-    EXECUTE 'SELECT 1 FROM information_schema.tables WHERE table_name = ''links'' AND table_schema = ''public''';
-    
-    IF FOUND THEN
-      EXECUTE '
-        INSERT INTO public.links (
-          user_id,
-          title,
-          url,
-          position,
-          is_active,
-          is_featured
-        ) VALUES (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6
-        )
-      ' USING 
+  IF v_links_exist THEN
+    BEGIN
+      INSERT INTO public.links (
+        user_id,
+        title,
+        url,
+        position,
+        is_active,
+        is_featured
+      ) VALUES (
         user_id,
         'Welcome to My Linktree',
         'https://docs.linktree.com/welcome',
         1,
         TRUE,
-        TRUE;
-    END IF;
-  EXCEPTION WHEN OTHERS THEN
-    -- Si la tabla links aún no existe o hay otro error, continuar sin error
-    NULL;
-  END;
+        TRUE
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'Error al crear link de bienvenida para el usuario %: %', user_id, SQLERRM;
+    END;
+  END IF;
   
   -- Log del sistema para registrar la creación automática (si la función existe)
-  BEGIN
-    PERFORM log_system_error(
-      user_id,
-      'user_creation',
-      'Usuario creado automáticamente con plan gratuito',
-      'info',
-      'auth',
-      jsonb_build_object(
-        'email', NEW.email,
-        'username', generated_username,
-        'auth_id', NEW.id,
-        'subscription_end', period_end
-      )
-    );
-  EXCEPTION WHEN OTHERS THEN
-    -- Si la función log_system_error aún no existe, continuar sin error
-    NULL;
-  END;
+  IF v_log_system_error_exists THEN
+    BEGIN
+      PERFORM log_system_error(
+        user_id,
+        'user_creation',
+        'Usuario creado automáticamente con plan gratuito',
+        'info',
+        'auth',
+        jsonb_build_object(
+          'email', NEW.email,
+          'username', generated_username,
+          'auth_id', NEW.id,
+          'subscription_end', period_end
+        )
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'Error al registrar creación de usuario %: %', user_id, SQLERRM;
+    END;
+  END IF;
   
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, app, extensions;
+$$ LANGUAGE plpgsql;
 
 -- Trigger que se dispara cuando se crea un nuevo usuario en auth
 DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;

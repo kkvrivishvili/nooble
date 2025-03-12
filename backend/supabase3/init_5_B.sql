@@ -10,9 +10,61 @@
 -- por ser accesibles públicamente.
 -- ==============================================
 
+-- Verificar dependencias cruciales
+DO $$
+BEGIN
+  -- Verificar que la tabla de usuarios existe
+  IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'users') THEN
+    RAISE EXCEPTION 'La tabla app.users no existe. Ejecute init_2.sql primero.';
+  END IF;
+  
+  -- Verificar que la tabla bots existe (para referencias en links)
+  IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'bots') THEN
+    RAISE WARNING 'La tabla public.bots no existe. Algunas referencias podrían fallar.';
+  END IF;
+END $$;
+
+-- Verificar que el esquema app existe
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'app') THEN
+    CREATE SCHEMA app;
+    RAISE NOTICE 'Esquema app creado';
+  END IF;
+END $$;
+
+-- Eliminar vistas de compatibilidad primero para evitar conflictos con DROP TABLE
+DROP VIEW IF EXISTS analytics CASCADE;
+DROP VIEW IF EXISTS system_errors CASCADE;
+DROP VIEW IF EXISTS usage_metrics CASCADE;
+DROP VIEW IF EXISTS quota_notifications CASCADE;
+
 -- Eliminar funciones para recrearlas desde cero
 DROP FUNCTION IF EXISTS create_analytics_partition() CASCADE;
 DROP FUNCTION IF EXISTS check_quota_thresholds() CASCADE;
+DROP FUNCTION IF EXISTS log_system_error() CASCADE;
+
+-- Eliminar triggers verificando primero si las tablas existen
+DO $$
+BEGIN
+  -- Verificar y eliminar triggers en esquema public si las tablas existen
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'usage_metrics') THEN
+    DROP TRIGGER IF EXISTS trigger_quota_threshold_check ON usage_metrics;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'analytics') THEN
+    DROP TRIGGER IF EXISTS create_analytics_partition_trigger ON analytics;
+  END IF;
+
+  -- Verificar y eliminar triggers en esquema app si las tablas existen
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'usage_metrics') THEN
+    DROP TRIGGER IF EXISTS trigger_quota_threshold_check ON app.usage_metrics;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'analytics') THEN
+    DROP TRIGGER IF EXISTS create_analytics_partition_trigger ON app.analytics;
+  END IF;
+END $$;
 
 -- Eliminar índices para evitar conflictos
 DO $$
@@ -25,17 +77,21 @@ DECLARE
         'idx_usage_metrics_unique', 'idx_usage_metrics_type', 'idx_usage_metrics_reset',
         'idx_quota_notifications_user', 'idx_quota_notifications_month'
     ];
+    index_exists BOOLEAN;
 BEGIN
     FOR i IN 1..array_length(indices, 1) LOOP
-        EXECUTE 'DROP INDEX IF EXISTS ' || indices[i];
+        -- Verificar si el índice existe antes de intentar eliminarlo
+        SELECT EXISTS (
+            SELECT 1 FROM pg_indexes 
+            WHERE indexname = indices[i] AND (schemaname = 'public' OR schemaname = 'app')
+        ) INTO index_exists;
+        
+        IF index_exists THEN
+            EXECUTE 'DROP INDEX IF EXISTS ' || indices[i];
+            RAISE NOTICE 'Índice % eliminado', indices[i];
+        END IF;
     END LOOP;
 END $$;
-
--- Eliminar triggers para recrearlos desde cero
-DROP TRIGGER IF EXISTS trigger_quota_threshold_check ON usage_metrics;
-DROP TRIGGER IF EXISTS trigger_quota_threshold_check ON app.usage_metrics;
-DROP TRIGGER IF EXISTS create_analytics_partition_trigger ON analytics;
-DROP TRIGGER IF EXISTS create_analytics_partition_trigger ON app.analytics;
 
 -- Eliminar tablas para recrearlas desde cero
 DROP TABLE IF EXISTS links CASCADE;
@@ -51,7 +107,7 @@ DROP TABLE IF EXISTS app.analytics CASCADE;
 DROP TABLE IF EXISTS app.usage_metrics CASCADE;
 DROP TABLE IF EXISTS app.quota_notifications CASCADE;
 
--- Buscar y eliminar particiones de analytics
+-- Buscar y eliminar particiones de analytics con manejo de errores mejorado
 DO $$
 DECLARE
     partition_table TEXT;
@@ -65,7 +121,12 @@ BEGIN
         FETCH partition_tables INTO partition_table;
         EXIT WHEN NOT FOUND;
         
-        EXECUTE 'DROP TABLE IF EXISTS ' || partition_table || ' CASCADE';
+        BEGIN
+            EXECUTE 'DROP TABLE IF EXISTS ' || partition_table || ' CASCADE';
+            RAISE NOTICE 'Partición % eliminada', partition_table;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'Error al eliminar partición %: %', partition_table, SQLERRM;
+        END;
     END LOOP;
     CLOSE partition_tables;
 END $$;
@@ -84,7 +145,12 @@ BEGIN
         FETCH partition_tables INTO partition_table;
         EXIT WHEN NOT FOUND;
         
-        EXECUTE 'DROP TABLE IF EXISTS app.' || partition_table || ' CASCADE';
+        BEGIN
+            EXECUTE 'DROP TABLE IF EXISTS app.' || partition_table || ' CASCADE';
+            RAISE NOTICE 'Partición app.% eliminada', partition_table;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'Error al eliminar partición app.%: %', partition_table, SQLERRM;
+        END;
     END LOOP;
     CLOSE partition_tables;
 END $$;
@@ -94,10 +160,10 @@ END $$;
 -- Tabla de Enlaces mejorada (públicamente accesible)
 CREATE TABLE IF NOT EXISTS public.links (
   id UUID PRIMARY KEY DEFAULT extensions.uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
   title VARCHAR(100) NOT NULL,
   url TEXT CHECK (url IS NULL OR url ~* '^https?://[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)$'),
-  bot_id UUID REFERENCES public.bots(id) ON DELETE SET NULL,
+  bot_id UUID, -- Referencia añadida después de comprobar existencia
   thumbnail_url TEXT CHECK (thumbnail_url IS NULL OR thumbnail_url ~* '^https?://[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)$'),
   icon_name VARCHAR(30),
   position INTEGER NOT NULL,
@@ -126,6 +192,17 @@ CREATE TABLE IF NOT EXISTS public.links (
   )
 );
 
+-- Añadir la constraint de la clave foránea si existe la tabla bots
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'bots') THEN
+    ALTER TABLE public.links ADD CONSTRAINT fk_links_bot_id FOREIGN KEY (bot_id) REFERENCES public.bots(id) ON DELETE SET NULL;
+    RAISE NOTICE 'Añadida referencia a bots en la tabla links';
+  END IF;
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'Error al añadir referencia a bots: %', SQLERRM;
+END $$;
+
 -- Índices mejorados para links
 CREATE INDEX idx_links_user_position ON public.links(user_id, position);
 CREATE INDEX idx_links_bot_id ON public.links(bot_id) WHERE bot_id IS NOT NULL;
@@ -138,7 +215,7 @@ CREATE INDEX idx_links_title_search ON public.links USING gin(title gin_trgm_ops
 -- Tabla para grupos de enlaces (públicamente accesible)
 CREATE TABLE IF NOT EXISTS public.link_groups (
   id UUID PRIMARY KEY DEFAULT extensions.uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
   name VARCHAR(50) NOT NULL,
   description TEXT,
   position INTEGER NOT NULL,
@@ -171,7 +248,7 @@ CREATE INDEX idx_link_group_items_link ON public.link_group_items(link_id);
 -- Tabla para registro de errores del sistema mejorada (interna)
 CREATE TABLE IF NOT EXISTS app.system_errors (
   id UUID PRIMARY KEY DEFAULT extensions.uuid_generate_v4(),
-  user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  user_id UUID REFERENCES app.users(id) ON DELETE SET NULL,
   error_type VARCHAR(50) NOT NULL,
   error_message TEXT NOT NULL,
   severity VARCHAR(20) DEFAULT 'error' CHECK (severity IN ('info', 'warning', 'error', 'critical')),
@@ -182,7 +259,7 @@ CREATE TABLE IF NOT EXISTS app.system_errors (
   user_agent TEXT,
   context JSONB DEFAULT '{}',
   is_resolved BOOLEAN DEFAULT FALSE,
-  resolved_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  resolved_by UUID REFERENCES app.users(id) ON DELETE SET NULL,
   resolved_at TIMESTAMP WITH TIME ZONE,
   resolution_notes TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -196,13 +273,100 @@ CREATE INDEX idx_system_errors_date ON app.system_errors(created_at);
 CREATE INDEX idx_system_errors_resolved ON app.system_errors(is_resolved, resolved_at);
 CREATE INDEX idx_system_errors_source ON app.system_errors(source, error_type);
 
--- ---------- SECCIÓN 3: ANALÍTICA PARTICIONADA (movida a esquema 'app') ----------
+-- Implementación de función log_system_error para registrar errores
+CREATE OR REPLACE FUNCTION log_system_error(
+  p_user_id UUID,
+  p_error_type VARCHAR(50),
+  p_error_message TEXT,
+  p_severity VARCHAR(20) DEFAULT 'error',
+  p_source VARCHAR(50) DEFAULT NULL,
+  p_context JSONB DEFAULT '{}'
+)
+RETURNS UUID AS $$
+DECLARE
+  v_error_id UUID;
+  v_context JSONB := p_context;
+BEGIN
+  -- Validar severidad
+  IF p_severity NOT IN ('info', 'warning', 'error', 'critical') THEN
+    p_severity := 'error';
+  END IF;
+  
+  -- Agregar timestamp al contexto
+  v_context := jsonb_set(v_context, '{timestamp}', to_jsonb(NOW()));
+  
+  -- Agregar a sistema de logs
+  INSERT INTO app.system_errors (
+    user_id, error_type, error_message, 
+    severity, source, context
+  )
+  VALUES (
+    p_user_id, p_error_type, p_error_message, 
+    p_severity, p_source, v_context
+  )
+  RETURNING id INTO v_error_id;
+  
+  -- Log crítico, notificar a administradores
+  IF p_severity = 'critical' THEN
+    -- Aquí podría agregarse código para enviar notificaciones
+    RAISE WARNING 'ERROR CRÍTICO: % - %', p_error_type, p_error_message;
+  END IF;
+  
+  RETURN v_error_id;
+EXCEPTION WHEN OTHERS THEN
+  -- Fallback para errores durante el logging
+  RAISE WARNING 'Error al registrar error: %', SQLERRM;
+  RETURN extensions.uuid_generate_v4(); -- Devolver un UUID para evitar nulos
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ---------- SECCIÓN 3: TABLAS DE MÉTRICAS Y NOTIFICACIONES ----------
+
+-- Tabla mejorada para cuotas de uso mensual (interna)
+CREATE TABLE IF NOT EXISTS app.usage_metrics (
+  id UUID PRIMARY KEY DEFAULT extensions.uuid_generate_v4(),
+  user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+  metric_type VARCHAR(30) NOT NULL,
+  count INTEGER NOT NULL DEFAULT 1,
+  year_month INTEGER NOT NULL, -- formato YYYYMM
+  daily_breakdown JSONB DEFAULT '{}',
+  quota_limit INTEGER,
+  quota_reset_date TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Índices mejorados para métricas
+CREATE UNIQUE INDEX idx_usage_metrics_unique ON app.usage_metrics(user_id, metric_type, year_month);
+CREATE INDEX idx_usage_metrics_type ON app.usage_metrics(metric_type, year_month);
+CREATE INDEX idx_usage_metrics_reset ON app.usage_metrics(quota_reset_date);
+CREATE INDEX idx_usage_metrics_user_metrics ON app.usage_metrics(user_id, metric_type);
+
+-- Tabla para notificaciones de cuota (interna)
+CREATE TABLE IF NOT EXISTS app.quota_notifications (
+  id UUID PRIMARY KEY DEFAULT extensions.uuid_generate_v4(),
+  user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+  metric_type VARCHAR(30) NOT NULL,
+  threshold_percent INTEGER NOT NULL, -- e.g. 80, 90, 100
+  message TEXT NOT NULL,
+  sent_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  year_month INTEGER NOT NULL, -- formato YYYYMM
+  is_read BOOLEAN DEFAULT FALSE,
+  read_at TIMESTAMP WITH TIME ZONE
+);
+
+-- Índices para notificaciones
+CREATE INDEX idx_quota_notifications_user ON app.quota_notifications(user_id, is_read);
+CREATE INDEX idx_quota_notifications_month ON app.quota_notifications(user_id, year_month);
+CREATE INDEX idx_quota_notifications_sent ON app.quota_notifications(sent_at DESC);
+
+-- ---------- SECCIÓN 4: ANALÍTICA PARTICIONADA (movida a esquema 'app') ----------
 
 -- Crear tabla particionada de analytics con mejor manejo (interna)
 CREATE TABLE IF NOT EXISTS app.analytics (
   id UUID NOT NULL DEFAULT extensions.uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  link_id UUID REFERENCES public.links(id) ON DELETE SET NULL,
+  user_id UUID NOT NULL REFERENCES app.users(id) ON DELETE CASCADE,
+  link_id UUID, -- Referencia añadida después de verificar
   visitor_ip TEXT,
   user_agent TEXT,
   referer TEXT,
@@ -224,6 +388,123 @@ CREATE TABLE IF NOT EXISTS app.analytics (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
   PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
+
+-- Añadir la referencia a links si la tabla existe
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'links') THEN
+    ALTER TABLE app.analytics ADD CONSTRAINT fk_analytics_link_id FOREIGN KEY (link_id) REFERENCES public.links(id) ON DELETE SET NULL;
+    RAISE NOTICE 'Añadida referencia a links en la tabla analytics';
+  END IF;
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'Error al añadir referencia a links: %', SQLERRM;
+END $$;
+
+-- ---------- SECCIÓN 5: FUNCIONES Y TRIGGERS ----------
+
+-- Trigger para monitorizar % de uso de cuota (mejorado con concurrencia)
+CREATE OR REPLACE FUNCTION check_quota_thresholds()
+RETURNS TRIGGER AS $$
+DECLARE
+  v_quota_limit INTEGER;
+  v_usage_percent INTEGER;
+  v_threshold INTEGER;
+  v_notification_exists BOOLEAN;
+  v_thresholds INTEGER[] := ARRAY[80, 90, 100]; -- Definir array de umbrales
+  v_log_function_exists BOOLEAN;
+BEGIN
+  -- Verificar si existe la función log_system_error
+  SELECT EXISTS (
+    SELECT 1 FROM pg_proc WHERE proname = 'log_system_error'
+  ) INTO v_log_function_exists;
+
+  -- Solo proceder si hay un límite de cuota definido
+  IF NEW.quota_limit IS NULL OR NEW.quota_limit <= 0 THEN
+    RETURN NEW;
+  END IF;
+  
+  -- Calcular porcentaje de uso
+  v_usage_percent := (NEW.count * 100) / NEW.quota_limit;
+  
+  -- Verificar umbrales (80%, 90%, 100%)
+  FOREACH v_threshold IN ARRAY v_thresholds LOOP
+    -- Si el uso supera el umbral
+    IF v_usage_percent >= v_threshold THEN
+      -- Verificar si ya existe notificación para este umbral (con FOR UPDATE para evitar condiciones de carrera)
+      SELECT EXISTS (
+        SELECT 1 FROM app.quota_notifications
+        WHERE user_id = NEW.user_id
+        AND metric_type = NEW.metric_type
+        AND year_month = NEW.year_month
+        AND threshold_percent = v_threshold
+        FOR UPDATE
+      ) INTO v_notification_exists;
+      
+      -- Si no existe, crear notificación
+      IF NOT v_notification_exists THEN
+        BEGIN
+          INSERT INTO app.quota_notifications (
+            user_id, metric_type, threshold_percent, year_month,
+            message
+          ) VALUES (
+            NEW.user_id, NEW.metric_type, v_threshold, NEW.year_month,
+            CASE 
+              WHEN v_threshold = 100 THEN 'Has alcanzado el 100% de tu cuota de ' || NEW.metric_type
+              ELSE 'Has alcanzado el ' || v_threshold || '% de tu cuota de ' || NEW.metric_type
+            END
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear notificación de cuota: %', SQLERRM;
+        END;
+        
+        -- Registrar la notificación en el log del sistema si la función existe
+        IF v_log_function_exists THEN
+          BEGIN
+            PERFORM log_system_error(
+              NEW.user_id,
+              'quota_threshold_reached',
+              'Usuario alcanzó ' || v_threshold || '% de su cuota de ' || NEW.metric_type,
+              'info',
+              'quota_monitor',
+              jsonb_build_object(
+                'metric_type', NEW.metric_type,
+                'threshold', v_threshold,
+                'current_usage', NEW.count,
+                'quota_limit', NEW.quota_limit,
+                'year_month', NEW.year_month
+              )
+            );
+          EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'Error al registrar notificación en log del sistema: %', SQLERRM;
+          END;
+        END IF;
+      END IF;
+    END IF;
+  END LOOP;
+  
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Añadir permiso SECURITY DEFINER si es necesario
+DO $$
+BEGIN
+  -- Si existe la función is_admin, es probable que necesitemos SECURITY DEFINER
+  IF EXISTS (
+    SELECT 1 FROM pg_proc WHERE proname = 'is_admin'
+  ) THEN
+    ALTER FUNCTION check_quota_thresholds() SECURITY DEFINER;
+    RAISE NOTICE 'Añadido SECURITY DEFINER a la función check_quota_thresholds';
+  END IF;
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'Error al modificar permisos de check_quota_thresholds: %', SQLERRM;
+END $$;
+
+-- Crear trigger para notificaciones
+CREATE TRIGGER trigger_quota_threshold_check
+AFTER INSERT OR UPDATE OF count, quota_limit ON app.usage_metrics
+FOR EACH ROW
+EXECUTE PROCEDURE check_quota_thresholds();
 
 -- Función para crear particiones de analytics
 -- Manteniendo el search_path original pero añadiendo app
@@ -276,15 +557,22 @@ BEGIN
       
       -- Crear políticas RLS para la partición
       IF NOT policy_exists THEN
-        EXECUTE format(
-          'CREATE POLICY analytics_partition_select_policy ON app.%I
-           FOR SELECT USING (
-             user_id IN (SELECT id FROM users WHERE auth.uid() = auth_id) OR
-             is_admin((SELECT id FROM users WHERE auth.uid() = auth_id)) OR
-             has_permission((SELECT id FROM users WHERE auth.uid() = auth_id), ''view_analytics'')
-           )', 
-          partition_name
-        );
+        BEGIN
+          EXECUTE format(
+            'CREATE POLICY analytics_partition_select_policy ON app.%I
+             FOR SELECT USING (
+               user_id IN (SELECT id FROM app.users WHERE auth.uid() = auth_id) OR
+               EXISTS (
+                 SELECT 1 FROM app.users u
+                 JOIN app.user_roles ur ON u.id = ur.user_id
+                 WHERE auth.uid() = u.auth_id AND (ur.role = ''admin'' OR ur.permissions->''view_analytics'' = ''true'')
+               )
+             )', 
+            partition_name
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear política select para partición %: %', partition_name, SQLERRM;
+        END;
       END IF;
       
       -- Verificar si la política de inserción ya existe
@@ -295,53 +583,81 @@ BEGIN
       ) INTO policy_exists;
       
       IF NOT policy_exists THEN
-        EXECUTE format(
-          'CREATE POLICY analytics_partition_insert_policy ON app.%I
-           FOR INSERT WITH CHECK (
-             user_id IN (SELECT id FROM users) -- Permitir inserción para usuarios reales
-           )', 
-          partition_name
-        );
+        BEGIN
+          EXECUTE format(
+            'CREATE POLICY analytics_partition_insert_policy ON app.%I
+             FOR INSERT WITH CHECK (
+               user_id IN (SELECT id FROM app.users) -- Permitir inserción para usuarios reales
+             )', 
+            partition_name
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear política insert para partición %: %', partition_name, SQLERRM;
+        END;
       END IF;
       
       -- Crear índices con nombres únicos
-      EXECUTE format(
-        'CREATE INDEX %I ON app.%I (user_id, created_at)',
-        partition_name || '_user_idx' || unique_suffix, 
-        partition_name
-      );
+      BEGIN
+        EXECUTE format(
+          'CREATE INDEX %I ON app.%I (user_id, created_at)',
+          partition_name || '_user_idx' || unique_suffix, 
+          partition_name
+        );
+      EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Error al crear índice user_idx para partición %: %', partition_name, SQLERRM;
+      END;
       
-      EXECUTE format(
-        'CREATE INDEX %I ON app.%I (created_at)',
-        partition_name || '_date_idx' || unique_suffix, 
-        partition_name
-      );
+      BEGIN
+        EXECUTE format(
+          'CREATE INDEX %I ON app.%I (created_at)',
+          partition_name || '_date_idx' || unique_suffix, 
+          partition_name
+        );
+      EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Error al crear índice date_idx para partición %: %', partition_name, SQLERRM;
+      END;
       
-      EXECUTE format(
-        'CREATE INDEX %I ON app.%I (link_id, created_at) WHERE link_id IS NOT NULL',
-        partition_name || '_link_idx' || unique_suffix, 
-        partition_name
-      );
+      BEGIN
+        EXECUTE format(
+          'CREATE INDEX %I ON app.%I (link_id, created_at) WHERE link_id IS NOT NULL',
+          partition_name || '_link_idx' || unique_suffix, 
+          partition_name
+        );
+      EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Error al crear índice link_idx para partición %: %', partition_name, SQLERRM;
+      END;
       
-      EXECUTE format(
-        'CREATE INDEX %I ON app.%I (country, city)',
-        partition_name || '_geo_idx' || unique_suffix, 
-        partition_name
-      );
+      BEGIN
+        EXECUTE format(
+          'CREATE INDEX %I ON app.%I (country, city)',
+          partition_name || '_geo_idx' || unique_suffix, 
+          partition_name
+        );
+      EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Error al crear índice geo_idx para partición %: %', partition_name, SQLERRM;
+      END;
 
       -- Añadir índices para búsquedas comunes
-      EXECUTE format(
-        'CREATE INDEX %I ON app.%I (session_id)',
-        partition_name || '_session_idx' || unique_suffix, 
-        partition_name
-      );
+      BEGIN
+        EXECUTE format(
+          'CREATE INDEX %I ON app.%I (session_id)',
+          partition_name || '_session_idx' || unique_suffix, 
+          partition_name
+        );
+      EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Error al crear índice session_idx para partición %: %', partition_name, SQLERRM;
+      END;
 
-      EXECUTE format(
-        'CREATE INDEX %I ON app.%I (utm_source, utm_medium, utm_campaign) 
-         WHERE utm_source IS NOT NULL',
-        partition_name || '_utm_idx' || unique_suffix, 
-        partition_name
-      );
+      BEGIN
+        EXECUTE format(
+          'CREATE INDEX %I ON app.%I (utm_source, utm_medium, utm_campaign) 
+           WHERE utm_source IS NOT NULL',
+          partition_name || '_utm_idx' || unique_suffix, 
+          partition_name
+        );
+      EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Error al crear índice utm_idx para partición %: %', partition_name, SQLERRM;
+      END;
 
       RAISE NOTICE 'Creada partición % para datos de analytics con RLS habilitado', partition_name;
     EXCEPTION WHEN OTHERS THEN
@@ -385,15 +701,22 @@ BEGIN
       
       -- Crear políticas RLS para la partición
       IF NOT policy_exists THEN
-        EXECUTE format(
-          'CREATE POLICY analytics_partition_select_policy ON app.%I
-           FOR SELECT USING (
-             user_id IN (SELECT id FROM users WHERE auth.uid() = auth_id) OR
-             is_admin((SELECT id FROM users WHERE auth.uid() = auth_id)) OR
-             has_permission((SELECT id FROM users WHERE auth.uid() = auth_id), ''view_analytics'')
-           )', 
-          partition_name
-        );
+        BEGIN
+          EXECUTE format(
+            'CREATE POLICY analytics_partition_select_policy ON app.%I
+             FOR SELECT USING (
+               user_id IN (SELECT id FROM app.users WHERE auth.uid() = auth_id) OR
+               EXISTS (
+                 SELECT 1 FROM app.users u
+                 JOIN app.user_roles ur ON u.id = ur.user_id
+                 WHERE auth.uid() = u.auth_id AND (ur.role = ''admin'' OR ur.permissions->''view_analytics'' = ''true'')
+               )
+             )',
+             partition_name
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear política select para partición anticipada %: %', partition_name, SQLERRM;
+        END;
       END IF;
       
       -- Verificar si la política de inserción ya existe
@@ -404,13 +727,17 @@ BEGIN
       ) INTO policy_exists;
       
       IF NOT policy_exists THEN
-        EXECUTE format(
-          'CREATE POLICY analytics_partition_insert_policy ON app.%I
-           FOR INSERT WITH CHECK (
-             user_id IN (SELECT id FROM users) -- Permitir inserción para usuarios reales
-           )', 
-          partition_name
-        );
+        BEGIN
+          EXECUTE format(
+            'CREATE POLICY analytics_partition_insert_policy ON app.%I
+             FOR INSERT WITH CHECK (
+               user_id IN (SELECT id FROM app.users) -- Permitir inserción para usuarios reales
+             )', 
+            partition_name
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear política insert para partición anticipada %: %', partition_name, SQLERRM;
+        END;
       END IF;
       
       RAISE NOTICE 'Creada partición anticipada % con RLS habilitado', partition_name;
@@ -451,15 +778,22 @@ BEGIN
       
       -- Crear políticas RLS para la partición
       IF NOT policy_exists THEN
-        EXECUTE format(
-          'CREATE POLICY analytics_partition_select_policy ON app.%I
-           FOR SELECT USING (
-             user_id IN (SELECT id FROM users WHERE auth.uid() = auth_id) OR
-             is_admin((SELECT id FROM users WHERE auth.uid() = auth_id)) OR
-             has_permission((SELECT id FROM users WHERE auth.uid() = auth_id), ''view_analytics'')
-           )', 
-          partition_name
-        );
+        BEGIN
+          EXECUTE format(
+            'CREATE POLICY analytics_partition_select_policy ON app.%I
+             FOR SELECT USING (
+               user_id IN (SELECT id FROM app.users WHERE auth.uid() = auth_id) OR
+               EXISTS (
+                 SELECT 1 FROM app.users u
+                 JOIN app.user_roles ur ON u.id = ur.user_id
+                 WHERE auth.uid() = u.auth_id AND (ur.role = ''admin'' OR ur.permissions->''view_analytics'' = ''true'')
+               )
+             )', 
+            partition_name
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear política select para partición anticipada %: %', partition_name, SQLERRM;
+        END;
       END IF;
       
       -- Verificar si la política de inserción ya existe
@@ -470,13 +804,17 @@ BEGIN
       ) INTO policy_exists;
       
       IF NOT policy_exists THEN
-        EXECUTE format(
-          'CREATE POLICY analytics_partition_insert_policy ON app.%I
-           FOR INSERT WITH CHECK (
-             user_id IN (SELECT id FROM users) -- Permitir inserción para usuarios reales
-           )', 
-          partition_name
-        );
+        BEGIN
+          EXECUTE format(
+            'CREATE POLICY analytics_partition_insert_policy ON app.%I
+             FOR INSERT WITH CHECK (
+               user_id IN (SELECT id FROM app.users) -- Permitir inserción para usuarios reales
+             )', 
+            partition_name
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear política insert para partición anticipada %: %', partition_name, SQLERRM;
+        END;
       END IF;
       
       RAISE NOTICE 'Creada partición anticipada % con RLS habilitado', partition_name;
@@ -487,7 +825,27 @@ BEGIN
   
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql SET search_path = public, app, extensions;
+$$ LANGUAGE plpgsql;
+
+-- Añadir permiso SECURITY DEFINER si es necesario
+DO $$
+BEGIN
+  -- Si existe la función is_admin, es probable que necesitemos SECURITY DEFINER
+  IF EXISTS (
+    SELECT 1 FROM pg_proc WHERE proname = 'is_admin'
+  ) THEN
+    ALTER FUNCTION create_analytics_partition() SECURITY DEFINER;
+    RAISE NOTICE 'Añadido SECURITY DEFINER a la función create_analytics_partition';
+  END IF;
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'Error al modificar permisos de create_analytics_partition: %', SQLERRM;
+END $$;
+
+-- Crear trigger para partition de analytics
+CREATE TRIGGER create_analytics_partition_trigger
+BEFORE INSERT ON app.analytics
+FOR EACH ROW
+EXECUTE PROCEDURE create_analytics_partition();
 
 -- Crear particiones iniciales manualmente para datos históricos y actuales
 DO $$
@@ -535,15 +893,22 @@ BEGIN
         
         -- Crear políticas RLS para la partición
         IF NOT policy_exists THEN
-          EXECUTE format(
-            'CREATE POLICY analytics_partition_select_policy ON app.%I
-             FOR SELECT USING (
-               user_id IN (SELECT id FROM users WHERE auth.uid() = auth_id) OR
-               is_admin((SELECT id FROM users WHERE auth.uid() = auth_id)) OR
-               has_permission((SELECT id FROM users WHERE auth.uid() = auth_id), ''view_analytics'')
-             )', 
-            partition_name
-          );
+          BEGIN
+            EXECUTE format(
+              'CREATE POLICY analytics_partition_select_policy ON app.%I
+               FOR SELECT USING (
+                 user_id IN (SELECT id FROM app.users WHERE auth.uid() = auth_id) OR
+                 EXISTS (
+                   SELECT 1 FROM app.users u
+                   JOIN app.user_roles ur ON u.id = ur.user_id
+                   WHERE auth.uid() = u.auth_id AND (ur.role = ''admin'' OR ur.permissions->''view_analytics'' = ''true'')
+                 )
+               )', 
+              partition_name
+            );
+          EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'Error al crear política select para partición inicial %: %', partition_name, SQLERRM;
+          END;
         END IF;
         
         -- Verificar si la política de inserción ya existe
@@ -554,33 +919,49 @@ BEGIN
         ) INTO policy_exists;
         
         IF NOT policy_exists THEN
-          EXECUTE format(
-            'CREATE POLICY analytics_partition_insert_policy ON app.%I
-             FOR INSERT WITH CHECK (
-               user_id IN (SELECT id FROM users) -- Permitir inserción para usuarios reales
-             )', 
-            partition_name
-          );
+          BEGIN
+            EXECUTE format(
+              'CREATE POLICY analytics_partition_insert_policy ON app.%I
+               FOR INSERT WITH CHECK (
+                 user_id IN (SELECT id FROM app.users) -- Permitir inserción para usuarios reales
+               )', 
+              partition_name
+            );
+          EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'Error al crear política insert para partición inicial %: %', partition_name, SQLERRM;
+          END;
         END IF;
         
         -- Índices básicos para particiones
-        EXECUTE format(
-          'CREATE INDEX %I ON app.%I (user_id, created_at)',
-          partition_name || '_user_idx', 
-          partition_name
-        );
+        BEGIN
+          EXECUTE format(
+            'CREATE INDEX %I ON app.%I (user_id, created_at)',
+            partition_name || '_user_idx', 
+            partition_name
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear índice user_idx para partición inicial %: %', partition_name, SQLERRM;
+        END;
         
-        EXECUTE format(
-          'CREATE INDEX %I ON app.%I (created_at)',
-          partition_name || '_date_idx', 
-          partition_name
-        );
+        BEGIN
+          EXECUTE format(
+            'CREATE INDEX %I ON app.%I (created_at)',
+            partition_name || '_date_idx', 
+            partition_name
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear índice date_idx para partición inicial %: %', partition_name, SQLERRM;
+        END;
         
-        EXECUTE format(
-          'CREATE INDEX %I ON app.%I (link_id, created_at) WHERE link_id IS NOT NULL',
-          partition_name || '_link_idx', 
-          partition_name
-        );
+        BEGIN
+          EXECUTE format(
+            'CREATE INDEX %I ON app.%I (link_id, created_at) WHERE link_id IS NOT NULL',
+            partition_name || '_link_idx', 
+            partition_name
+          );
+        EXCEPTION WHEN OTHERS THEN
+          RAISE WARNING 'Error al crear índice link_idx para partición inicial %: %', partition_name, SQLERRM;
+        END;
         
         RAISE NOTICE 'Creada partición % para datos de analytics con RLS habilitado', partition_name;
       EXCEPTION WHEN OTHERS THEN
@@ -590,125 +971,41 @@ BEGIN
   END LOOP;
 END $$;
 
--- ---------- SECCIÓN 4: MÉTRICAS DE USO Y NOTIFICACIONES (movidas a esquema 'app') ----------
-
--- Tabla mejorada para cuotas de uso mensual (interna)
-CREATE TABLE IF NOT EXISTS app.usage_metrics (
-  id UUID PRIMARY KEY DEFAULT extensions.uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  metric_type VARCHAR(30) NOT NULL,
-  count INTEGER NOT NULL DEFAULT 1,
-  year_month INTEGER NOT NULL, -- formato YYYYMM
-  daily_breakdown JSONB DEFAULT '{}',
-  quota_limit INTEGER,
-  quota_reset_date TIMESTAMP WITH TIME ZONE,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Índices mejorados para métricas
-CREATE UNIQUE INDEX idx_usage_metrics_unique ON app.usage_metrics(user_id, metric_type, year_month);
-CREATE INDEX idx_usage_metrics_type ON app.usage_metrics(metric_type, year_month);
-CREATE INDEX idx_usage_metrics_reset ON app.usage_metrics(quota_reset_date);
-CREATE INDEX idx_usage_metrics_user_metrics ON app.usage_metrics(user_id, metric_type);
-
--- Tabla para notificaciones de cuota (interna)
-CREATE TABLE IF NOT EXISTS app.quota_notifications (
-  id UUID PRIMARY KEY DEFAULT extensions.uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  metric_type VARCHAR(30) NOT NULL,
-  threshold_percent INTEGER NOT NULL, -- e.g. 80, 90, 100
-  message TEXT NOT NULL,
-  sent_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  year_month INTEGER NOT NULL, -- formato YYYYMM
-  is_read BOOLEAN DEFAULT FALSE,
-  read_at TIMESTAMP WITH TIME ZONE
-);
-
--- Índices para notificaciones
-CREATE INDEX idx_quota_notifications_user ON app.quota_notifications(user_id, is_read);
-CREATE INDEX idx_quota_notifications_month ON app.quota_notifications(user_id, year_month);
-CREATE INDEX idx_quota_notifications_sent ON app.quota_notifications(sent_at DESC);
-
--- Trigger para monitorizar % de uso de cuota (mejorado con concurrencia)
-CREATE OR REPLACE FUNCTION check_quota_thresholds()
+-- Función para incrementar contadores de clics en enlaces desde analytics
+CREATE OR REPLACE FUNCTION increment_link_clicks()
 RETURNS TRIGGER AS $$
-DECLARE
-  v_quota_limit INTEGER;
-  v_usage_percent INTEGER;
-  v_threshold INTEGER;
-  v_notification_exists BOOLEAN;
-  v_thresholds INTEGER[] := ARRAY[80, 90, 100]; -- Definir array de umbrales
 BEGIN
-  -- Solo proceder si hay un límite de cuota definido
-  IF NEW.quota_limit IS NULL OR NEW.quota_limit <= 0 THEN
+  -- Solo proceder si link_id no es nulo
+  IF NEW.link_id IS NULL THEN
     RETURN NEW;
   END IF;
   
-  -- Calcular porcentaje de uso
-  v_usage_percent := (NEW.count * 100) / NEW.quota_limit;
-  
-  -- Verificar umbrales (80%, 90%, 100%)
-  FOREACH v_threshold IN ARRAY v_thresholds LOOP
-    -- Si el uso supera el umbral
-    IF v_usage_percent >= v_threshold THEN
-      -- Verificar si ya existe notificación para este umbral (con FOR UPDATE para evitar condiciones de carrera)
-      SELECT EXISTS (
-        SELECT 1 FROM app.quota_notifications
-        WHERE user_id = NEW.user_id
-        AND metric_type = NEW.metric_type
-        AND year_month = NEW.year_month
-        AND threshold_percent = v_threshold
-        FOR UPDATE
-      ) INTO v_notification_exists;
-      
-      -- Si no existe, crear notificación
-      IF NOT v_notification_exists THEN
-        INSERT INTO app.quota_notifications (
-          user_id, metric_type, threshold_percent, year_month,
-          message
-        ) VALUES (
-          NEW.user_id, NEW.metric_type, v_threshold, NEW.year_month,
-          CASE 
-            WHEN v_threshold = 100 THEN 'Has alcanzado el 100% de tu cuota de ' || NEW.metric_type
-            ELSE 'Has alcanzado el ' || v_threshold || '% de tu cuota de ' || NEW.metric_type
-          END
-        );
-        
-        -- Registrar la notificación en el log del sistema
-        PERFORM log_system_error(
-          NEW.user_id,
-          'quota_threshold_reached',
-          'Usuario alcanzó ' || v_threshold || '% de su cuota de ' || NEW.metric_type,
-          'info',
-          'quota_monitor',
-          jsonb_build_object(
-            'metric_type', NEW.metric_type,
-            'threshold', v_threshold,
-            'current_usage', NEW.count,
-            'quota_limit', NEW.quota_limit,
-            'year_month', NEW.year_month
-          )
-        );
-      END IF;
-    END IF;
-  END LOOP;
+  -- Bloquear el registro para evitar condiciones de carrera
+  BEGIN
+    PERFORM id FROM public.links WHERE id = NEW.link_id FOR UPDATE NOWAIT;
+    
+    -- Incrementar contador
+    UPDATE public.links SET 
+        click_count = click_count + 1,
+        updated_at = NOW()
+    WHERE id = NEW.link_id;
+  EXCEPTION WHEN OTHERS THEN
+    -- Si falla el bloqueo o actualización, solo logear el error y continuar
+    RAISE WARNING 'Error al actualizar contador de clics para link_id=%: %', NEW.link_id, SQLERRM;
+  END;
   
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql SET search_path = public, app, extensions;
+$$ LANGUAGE plpgsql;
 
--- Crear trigger para notificaciones
-CREATE TRIGGER trigger_quota_threshold_check
-AFTER INSERT OR UPDATE OF count, quota_limit ON app.usage_metrics
+-- Crear trigger para incrementar clics
+CREATE TRIGGER increment_clicks_on_analytics
+AFTER INSERT ON app.analytics
 FOR EACH ROW
-EXECUTE PROCEDURE check_quota_thresholds();
+WHEN (NEW.link_id IS NOT NULL)
+EXECUTE PROCEDURE increment_link_clicks();
 
--- Crear trigger para partition de analytics
-CREATE TRIGGER create_analytics_partition_trigger
-BEFORE INSERT ON app.analytics
-FOR EACH ROW
-EXECUTE PROCEDURE create_analytics_partition();
+-- ---------- SECCIÓN 6: VISTAS DE COMPATIBILIDAD ----------
 
 -- Crear vistas de compatibilidad para mantener código existente funcionando
 -- Estas vistas pueden eliminarse en una fase posterior de la migración

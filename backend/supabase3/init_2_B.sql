@@ -19,6 +19,7 @@
 
 -- Eliminar tablas para recrearlas desde cero
 DROP TABLE IF EXISTS themes CASCADE;
+DROP TABLE IF EXISTS public.themes CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
 DROP TABLE IF EXISTS app.users CASCADE;
 DROP TABLE IF EXISTS user_config CASCADE;
@@ -148,6 +149,14 @@ COMMENT ON COLUMN app.users.updated_at IS 'Fecha y hora de última actualizació
 
 -- ---------- SECCIÓN 3: CONFIGURACIÓN ESPECÍFICA DE USUARIO ----------
 
+-- Verificar si la tabla system_config existe antes de crear user_config
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'system_config') THEN
+    RAISE EXCEPTION 'La tabla app.system_config no existe. Ejecute primero init_1.sql';
+  END IF;
+END $$;
+
 -- Tabla de configuración específica por usuario (movida a esquema 'app')
 -- Permite sobrescribir valores de configuración global para usuarios específicos
 CREATE TABLE IF NOT EXISTS app.user_config (
@@ -240,68 +249,73 @@ DO UPDATE SET
   description = EXCLUDED.description,
   updated_at = NOW();
 
--- Configuración inicial por tipo de suscripción
-INSERT INTO app.subscription_plan_config (plan_type, config_key, value, description)
-VALUES
-  -- Plan Gratuito
-  ('free', 'default_user_quota_bots', '1', 'Número máximo de bots para usuarios gratuitos'),
-  ('free', 'default_user_quota_collections', '3', 'Número máximo de colecciones de documentos para usuarios gratuitos'),
-  ('free', 'default_user_quota_documents', '50', 'Número máximo de documentos para usuarios gratuitos'),
-  ('free', 'default_user_quota_vector_searches', '100', 'Búsquedas vectoriales diarias para usuarios gratuitos'),
-  ('free', 'user_enable_advanced_analytics', 'false', 'Los usuarios gratuitos no tienen acceso a analytics avanzados'),
-  ('free', 'user_custom_bot_model', 'gpt-3.5-turbo', 'Modelo predeterminado para usuarios gratuitos'),
-  ('free', 'user_rate_limit', '30', 'Límite de peticiones por minuto para usuarios gratuitos'),
-  ('free', 'user_max_token_length', '2048', 'Longitud máxima de tokens para peticiones de usuarios gratuitos'),
-  ('free', 'user_max_conversation_length', '10', 'Máximo de conversaciones guardadas para usuarios gratuitos'),
-  ('free', 'user_max_message_length', '1000', 'Longitud máxima de mensajes para usuarios gratuitos'),
-  
-  -- Plan Básico
-  ('basic', 'default_user_quota_bots', '3', 'Número máximo de bots para usuarios básicos'),
-  ('basic', 'default_user_quota_collections', '5', 'Número máximo de colecciones para usuarios básicos'),
-  ('basic', 'default_user_quota_documents', '100', 'Número máximo de documentos para usuarios básicos'),
-  ('basic', 'default_user_quota_vector_searches', '500', 'Búsquedas vectoriales diarias para usuarios básicos'),
-  ('basic', 'user_enable_advanced_analytics', 'true', 'Los usuarios básicos tienen acceso a analytics avanzados'),
-  ('basic', 'user_custom_bot_model', 'gpt-3.5-turbo', 'Modelo predeterminado para usuarios básicos'),
-  ('basic', 'user_rate_limit', '60', 'Límite de peticiones por minuto para usuarios básicos'),
-  ('basic', 'user_max_token_length', '4096', 'Longitud máxima de tokens para peticiones de usuarios básicos'),
-  ('basic', 'user_max_conversation_length', '50', 'Máximo de conversaciones guardadas para usuarios básicos'),
-  ('basic', 'user_max_message_length', '2000', 'Longitud máxima de mensajes para usuarios básicos'),
-  
-  -- Plan Premium
-  ('premium', 'default_user_quota_bots', '5', 'Número máximo de bots para usuarios premium'),
-  ('premium', 'default_user_quota_collections', '10', 'Número máximo de colecciones para usuarios premium'),
-  ('premium', 'default_user_quota_documents', '200', 'Número máximo de documentos para usuarios premium'),
-  ('premium', 'default_user_quota_vector_searches', '1000', 'Búsquedas vectoriales diarias para usuarios premium'),
-  ('premium', 'user_enable_advanced_analytics', 'true', 'Los usuarios premium tienen acceso a analytics avanzados'),
-  ('premium', 'user_custom_bot_model', 'gpt-4', 'Modelo predeterminado para usuarios premium'),
-  ('premium', 'user_rate_limit', '120', 'Límite de peticiones por minuto para usuarios premium'),
-  ('premium', 'user_max_token_length', '8192', 'Longitud máxima de tokens para peticiones de usuarios premium'),
-  ('premium', 'user_max_conversation_length', '500', 'Máximo de conversaciones guardadas para usuarios premium'),
-  ('premium', 'user_max_message_length', '4000', 'Longitud máxima de mensajes para usuarios premium'),
-  
-  -- Plan Enterprise
-  ('enterprise', 'default_user_quota_bots', '20', 'Número máximo de bots para usuarios enterprise'),
-  ('enterprise', 'default_user_quota_collections', '50', 'Número máximo de colecciones para usuarios enterprise'),
-  ('enterprise', 'default_user_quota_documents', '1000', 'Número máximo de documentos para usuarios enterprise'),
-  ('enterprise', 'default_user_quota_vector_searches', '5000', 'Búsquedas vectoriales diarias para usuarios enterprise'),
-  ('enterprise', 'user_enable_advanced_analytics', 'true', 'Los usuarios enterprise tienen acceso a analytics avanzados'),
-  ('enterprise', 'user_custom_bot_model', 'gpt-4', 'Modelo predeterminado para usuarios enterprise'),
-  ('enterprise', 'user_rate_limit', '300', 'Límite de peticiones por minuto para usuarios enterprise'),
-  ('enterprise', 'user_max_token_length', '16384', 'Longitud máxima de tokens para peticiones de usuarios enterprise'),
-  ('enterprise', 'user_max_conversation_length', 'unlimited', 'Sin límite de conversaciones guardadas para usuarios enterprise'),
-  ('enterprise', 'user_max_message_length', '8000', 'Longitud máxima de mensajes para usuarios enterprise')
-ON CONFLICT (plan_type, config_key) 
-DO UPDATE SET 
-  value = EXCLUDED.value,
-  description = EXCLUDED.description,
-  updated_at = NOW();
+-- Verificar y configurar los planes sólo si system_config existe
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'app' AND table_name = 'system_config') THEN
+    -- Configuración inicial por tipo de suscripción
+    INSERT INTO app.subscription_plan_config (plan_type, config_key, value, description)
+    VALUES
+      -- Plan Gratuito
+      ('free', 'default_user_quota_bots', '1', 'Número máximo de bots para usuarios gratuitos'),
+      ('free', 'default_user_quota_collections', '3', 'Número máximo de colecciones de documentos para usuarios gratuitos'),
+      ('free', 'default_user_quota_documents', '50', 'Número máximo de documentos para usuarios gratuitos'),
+      ('free', 'default_user_quota_vector_searches', '100', 'Búsquedas vectoriales diarias para usuarios gratuitos'),
+      ('free', 'user_enable_advanced_analytics', 'false', 'Los usuarios gratuitos no tienen acceso a analytics avanzados'),
+      ('free', 'user_custom_bot_model', 'gpt-3.5-turbo', 'Modelo predeterminado para usuarios gratuitos'),
+      ('free', 'user_rate_limit', '30', 'Límite de peticiones por minuto para usuarios gratuitos'),
+      ('free', 'user_max_token_length', '2048', 'Longitud máxima de tokens para peticiones de usuarios gratuitos'),
+      ('free', 'user_max_conversation_length', '10', 'Máximo de conversaciones guardadas para usuarios gratuitos'),
+      ('free', 'user_max_message_length', '1000', 'Longitud máxima de mensajes para usuarios gratuitos'),
+      
+      -- Plan Básico
+      ('basic', 'default_user_quota_bots', '3', 'Número máximo de bots para usuarios básicos'),
+      ('basic', 'default_user_quota_collections', '5', 'Número máximo de colecciones para usuarios básicos'),
+      ('basic', 'default_user_quota_documents', '100', 'Número máximo de documentos para usuarios básicos'),
+      ('basic', 'default_user_quota_vector_searches', '500', 'Búsquedas vectoriales diarias para usuarios básicos'),
+      ('basic', 'user_enable_advanced_analytics', 'true', 'Los usuarios básicos tienen acceso a analytics avanzados'),
+      ('basic', 'user_custom_bot_model', 'gpt-3.5-turbo', 'Modelo predeterminado para usuarios básicos'),
+      ('basic', 'user_rate_limit', '60', 'Límite de peticiones por minuto para usuarios básicos'),
+      ('basic', 'user_max_token_length', '4096', 'Longitud máxima de tokens para peticiones de usuarios básicos'),
+      ('basic', 'user_max_conversation_length', '50', 'Máximo de conversaciones guardadas para usuarios básicos'),
+      ('basic', 'user_max_message_length', '2000', 'Longitud máxima de mensajes para usuarios básicos'),
+      
+      -- Plan Premium
+      ('premium', 'default_user_quota_bots', '5', 'Número máximo de bots para usuarios premium'),
+      ('premium', 'default_user_quota_collections', '10', 'Número máximo de colecciones para usuarios premium'),
+      ('premium', 'default_user_quota_documents', '200', 'Número máximo de documentos para usuarios premium'),
+      ('premium', 'default_user_quota_vector_searches', '1000', 'Búsquedas vectoriales diarias para usuarios premium'),
+      ('premium', 'user_enable_advanced_analytics', 'true', 'Los usuarios premium tienen acceso a analytics avanzados'),
+      ('premium', 'user_custom_bot_model', 'gpt-4', 'Modelo predeterminado para usuarios premium'),
+      ('premium', 'user_rate_limit', '120', 'Límite de peticiones por minuto para usuarios premium'),
+      ('premium', 'user_max_token_length', '8192', 'Longitud máxima de tokens para peticiones de usuarios premium'),
+      ('premium', 'user_max_conversation_length', '500', 'Máximo de conversaciones guardadas para usuarios premium'),
+      ('premium', 'user_max_message_length', '4000', 'Longitud máxima de mensajes para usuarios premium'),
+      
+      -- Plan Enterprise
+      ('enterprise', 'default_user_quota_bots', '20', 'Número máximo de bots para usuarios enterprise'),
+      ('enterprise', 'default_user_quota_collections', '50', 'Número máximo de colecciones para usuarios enterprise'),
+      ('enterprise', 'default_user_quota_documents', '1000', 'Número máximo de documentos para usuarios enterprise'),
+      ('enterprise', 'default_user_quota_vector_searches', '5000', 'Búsquedas vectoriales diarias para usuarios enterprise'),
+      ('enterprise', 'user_enable_advanced_analytics', 'true', 'Los usuarios enterprise tienen acceso a analytics avanzados'),
+      ('enterprise', 'user_custom_bot_model', 'gpt-4', 'Modelo predeterminado para usuarios enterprise'),
+      ('enterprise', 'user_rate_limit', '300', 'Límite de peticiones por minuto para usuarios enterprise'),
+      ('enterprise', 'user_max_token_length', '16384', 'Longitud máxima de tokens para peticiones de usuarios enterprise'),
+      ('enterprise', 'user_max_conversation_length', 'unlimited', 'Sin límite de conversaciones guardadas para usuarios enterprise'),
+      ('enterprise', 'user_max_message_length', '8000', 'Longitud máxima de mensajes para usuarios enterprise')
+    ON CONFLICT (plan_type, config_key) 
+    DO UPDATE SET 
+      value = EXCLUDED.value,
+      description = EXCLUDED.description,
+      updated_at = NOW();
+  ELSE
+    RAISE WARNING 'No se pudo insertar la configuración de planes porque app.system_config no existe. Ejecute init_1.sql primero.';
+  END IF;
+END $$;
 
 -- ---------- SECCIÓN 5: FUNCIONES DE COMPATIBILIDAD ----------
 
--- Estas funciones se crean solo para mantener compatibilidad con código existente
--- Las funciones principales ya se implementaron en init_1.sql
-
--- Vista de compatibilidad para mantener código existente funcionando
+-- Estas vistas se crean solo para mantener compatibilidad con código existente
 CREATE OR REPLACE VIEW users AS 
   SELECT * FROM app.users;
 

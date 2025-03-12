@@ -82,6 +82,8 @@ VALUES
   ('user_custom_bot_model', 'gpt-3.5-turbo', 'Modelo personalizado para bots del usuario', 'user', 'text', TRUE, TRUE, FALSE, NULL, NULL),
   ('user_rate_limit', '60', 'Límite de peticiones por minuto para el usuario', 'user', 'integer', TRUE, TRUE, FALSE, '10', '1000'),
   ('user_max_token_length', '4096', 'Longitud máxima de tokens para peticiones', 'user', 'integer', TRUE, TRUE, FALSE, '1024', '16384'),
+  ('user_max_message_length', '2000', 'Longitud máxima de mensajes para el usuario', 'user', 'integer', TRUE, TRUE, FALSE, '100', '10000'),
+  ('user_max_conversation_length', '50', 'Máximo de conversaciones guardadas para el usuario', 'user', 'integer', TRUE, TRUE, FALSE, '5', '1000'),
   
   -- Configuraciones de seguridad
   ('security_password_min_length', '8', 'Longitud mínima de contraseña', 'global', 'integer', TRUE, TRUE, FALSE, '6', '32'),
@@ -150,7 +152,7 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, app, extensions;
 
--- Función única mejorada para obtener configuración tipada
+-- Función para obtener configuración tipada (CORREGIDA)
 CREATE OR REPLACE FUNCTION get_typed_config(
   p_key TEXT, 
   p_default ANYELEMENT
@@ -159,7 +161,6 @@ RETURNS ANYELEMENT AS $$
 DECLARE
   v_value TEXT;
   v_data_type TEXT;
-  v_result ANYELEMENT;
 BEGIN
   -- Obtener valor y tipo de dato de la configuración
   SELECT value, data_type INTO v_value, v_data_type 
