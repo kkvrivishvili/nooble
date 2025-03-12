@@ -51,82 +51,31 @@ DROP VIEW IF EXISTS quota_notifications CASCADE;
 -- ---------- SECCIÓN 1: ÍNDICES ADICIONALES PARA OPTIMIZACIÓN ----------
 
 -- Índice para metadatos de vector_analytics (mejora búsquedas en vectores)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes 
-    WHERE indexname = 'idx_vector_analytics_metadata_jsonb_path' 
-    AND schemaname = 'app'
-  ) THEN
-    CREATE INDEX idx_vector_analytics_metadata_jsonb_path 
-    ON app.vector_analytics USING GIN (metadata jsonb_path_ops);
-    RAISE NOTICE 'Creado índice para búsquedas eficientes en metadatos de vector_analytics';
-  END IF;
-END $$;
+CREATE INDEX IF NOT EXISTS idx_vector_analytics_metadata_jsonb_path 
+ON app.vector_analytics USING GIN (metadata jsonb_path_ops);
 
 -- Índice para filtrado por fecha en mensajes (optimiza vistas de actividad)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes 
-    WHERE indexname = 'idx_messages_created_at' 
-    AND schemaname = 'public'
-  ) THEN
-    CREATE INDEX idx_messages_created_at 
-    ON public.messages (created_at);
-    RAISE NOTICE 'Creado índice para filtrado por fecha en messages';
-  END IF;
-END $$;
+CREATE INDEX IF NOT EXISTS idx_messages_created_at 
+ON public.messages (created_at);
 
 -- Índice para mejorar consultas por latencia en messages (optimiza análisis de bots)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes 
-    WHERE indexname = 'idx_messages_latency_ms' 
-    AND schemaname = 'public'
-  ) THEN
-    CREATE INDEX idx_messages_latency_ms 
-    ON public.messages (latency_ms) 
-    WHERE latency_ms IS NOT NULL;
-    RAISE NOTICE 'Creado índice para consultas de latencia en messages';
-  END IF;
-END $$;
+CREATE INDEX IF NOT EXISTS idx_messages_latency_ms 
+ON public.messages (latency_ms) 
+WHERE latency_ms IS NOT NULL;
 
 -- Índice para búsquedas de bots por user_id (optimiza múltiples vistas)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes 
-    WHERE indexname = 'idx_bots_user_id_deleted_at' 
-    AND schemaname = 'public'
-  ) THEN
-    CREATE INDEX idx_bots_user_id_deleted_at 
-    ON public.bots (user_id) 
-    WHERE deleted_at IS NULL;
-    RAISE NOTICE 'Creado índice para consulta de bots por usuario (no eliminados)';
-  END IF;
-END $$;
+CREATE INDEX IF NOT EXISTS idx_bots_user_id_deleted_at 
+ON public.bots (user_id) 
+WHERE deleted_at IS NULL;
 
 -- Índice para búsquedas por conversation_id y is_user (muy usado en vistas)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes 
-    WHERE indexname = 'idx_messages_conversation_id_is_user' 
-    AND schemaname = 'public'
-  ) THEN
-    CREATE INDEX idx_messages_conversation_id_is_user 
-    ON public.messages (conversation_id, is_user);
-    RAISE NOTICE 'Creado índice para consultas de mensajes por conversación y tipo';
-  END IF;
-END $$;
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_is_user 
+ON public.messages (conversation_id, is_user);
 
 -- ---------- SECCIÓN 2: VISTAS DE ANÁLISIS DE ACTIVIDAD ----------
 
 -- Vista para análisis de interacción de usuarios por día
 CREATE OR REPLACE VIEW daily_user_activity 
-WITH (security_invoker=true) 
 AS SELECT 
   c.user_id,
   DATE(m.created_at) AS activity_date,
@@ -147,7 +96,6 @@ COMMENT ON VIEW daily_user_activity IS 'Análisis diario de actividad de usuario
 
 -- Vista para usuarios con roles
 CREATE OR REPLACE VIEW users_with_roles 
-WITH (security_invoker=true) 
 AS SELECT 
   u.id,
   u.username,
@@ -230,7 +178,7 @@ SELECT
   ) AS extended_stats
 FROM public.bots b
 JOIN app.users u ON b.user_id = u.id
-LEFT JOIN public.conversations c ON b.id = c.bot_id AND c.deleted_at IS NULL
+LEFT JOIN public.conversations c ON b.id = c.bot_id
 LEFT JOIN public.messages m ON c.id = m.conversation_id AND m.is_user = FALSE
 LEFT JOIN feedback_stats fs ON b.id = fs.bot_id
 LEFT JOIN app.vector_analytics v ON b.id = v.bot_id
@@ -245,7 +193,6 @@ COMMENT ON VIEW bot_performance IS 'Métricas de rendimiento para bots con estad
 
 -- Vista materializada de bot_performance para mejor rendimiento en paneles administrativos
 CREATE MATERIALIZED VIEW bot_performance_mat
-WITH (security_invoker=true) 
 AS SELECT *, NOW() AS last_refresh
 FROM bot_performance;
 
@@ -257,9 +204,7 @@ CREATE INDEX idx_bot_performance_mat_popularity ON bot_performance_mat(popularit
 COMMENT ON MATERIALIZED VIEW bot_performance_mat IS 'Vista materializada de métricas de rendimiento para bots con actualización programada';
 
 -- Vista para análisis de uso de documentos
-CREATE OR REPLACE VIEW document_usage 
-WITH (security_invoker=true) 
-AS WITH recent_hits AS (
+CREATE OR REPLACE VIEW document_usage AS WITH recent_hits AS (
   SELECT 
     dch2.document_id,
     COUNT(DISTINCT va.id) AS hit_count
@@ -311,7 +256,6 @@ COMMENT ON VIEW document_usage IS 'Estadísticas detalladas sobre el uso de docu
 
 -- Vista para roles de administrador
 CREATE OR REPLACE VIEW admin_users 
-WITH (security_invoker=true) 
 AS SELECT 
   u.id,
   u.username,
@@ -337,9 +281,7 @@ ORDER BY u.username;
 COMMENT ON VIEW admin_users IS 'Lista de usuarios con permisos de administrador para gestión del sistema';
 
 -- Vista para configuración de usuarios
-CREATE OR REPLACE VIEW user_config_view 
-WITH (security_invoker=true) 
-AS SELECT 
+CREATE OR REPLACE VIEW user_config_view AS SELECT
   u.id AS user_id,
   u.username,
   u.email,
@@ -379,9 +321,7 @@ WHERE
 COMMENT ON VIEW user_config_view IS 'Vista consolidada de configuración efectiva por usuario, incluyendo origen de valores';
 
 -- Vista para administración de configuraciones por plan
-CREATE OR REPLACE VIEW plan_config_view 
-WITH (security_invoker=true) 
-AS WITH plan_types AS (
+CREATE OR REPLACE VIEW plan_config_view AS WITH plan_types AS (
   SELECT unnest(ARRAY['free', 'basic', 'premium', 'enterprise']) AS plan_type
 )
 SELECT 
@@ -414,9 +354,7 @@ ORDER BY
 COMMENT ON VIEW plan_config_view IS 'Vista para administración de configuraciones por tipo de plan de suscripción';
 
 -- Vista para subscripciones activas
-CREATE OR REPLACE VIEW active_subscriptions 
-WITH (security_invoker=true) 
-AS SELECT
+CREATE OR REPLACE VIEW active_subscriptions AS SELECT
   s.id AS subscription_id,
   s.user_id,
   u.username,
@@ -464,7 +402,7 @@ AS WITH bot_stats AS (
     COUNT(DISTINCT c.id) AS conversation_count,
     MAX(c.last_activity_at) AS last_activity_at
   FROM public.conversations c
-  WHERE c.deleted_at IS NULL
+  WHERE 1=1
   GROUP BY c.bot_id
 ),
 feedback_stats AS (
@@ -475,7 +413,7 @@ feedback_stats AS (
   FROM public.conversations c
   JOIN public.messages m ON c.id = m.conversation_id
   JOIN app.bot_response_feedback f ON m.id = f.message_id
-  WHERE c.deleted_at IS NULL
+  WHERE 1=1
   GROUP BY c.bot_id
 )
 SELECT
@@ -525,9 +463,7 @@ ORDER BY
 COMMENT ON VIEW public_bots IS 'Bots públicos disponibles para la comunidad con estadísticas relevantes';
 
 -- Vista materializada de public_bots para mejor rendimiento en frontend
-CREATE MATERIALIZED VIEW public_bots_mat
-WITH (security_invoker=true)
-AS SELECT *, NOW() AS last_refresh
+CREATE MATERIALIZED VIEW public_bots_mat AS SELECT *, NOW() AS last_refresh
 FROM public_bots;
 
 -- Crear índices para la vista materializada
@@ -538,56 +474,19 @@ CREATE INDEX idx_public_bots_mat_creator ON public_bots_mat(creator_id);
 
 COMMENT ON MATERIALIZED VIEW public_bots_mat IS 'Vista materializada de bots públicos para la comunidad con actualización programada';
 
--- Verificación de security_invoker para public_bots
-DO $$
-DECLARE
-  security_type TEXT;
-BEGIN
-  SELECT CASE 
-           WHEN securitypolicy THEN 'SECURITY DEFINER' 
-           ELSE 'SECURITY INVOKER' 
-         END 
-  INTO security_type
-  FROM pg_views 
-  WHERE schemaname = 'public' AND viewname = 'public_bots';
-  
-  IF security_type = 'SECURITY DEFINER' THEN
-    RAISE WARNING 'La vista public_bots está configurada como SECURITY DEFINER. Corrigiendo...';
-    
-    ALTER VIEW public_bots SET (security_invoker=true);
-    
-    -- Verificar de nuevo para confirmar la corrección
-    SELECT CASE 
-             WHEN securitypolicy THEN 'SECURITY DEFINER' 
-             ELSE 'SECURITY INVOKER' 
-           END 
-    INTO security_type
-    FROM pg_views 
-    WHERE schemaname = 'public' AND viewname = 'public_bots';
-    
-    IF security_type = 'SECURITY DEFINER' THEN
-      RAISE WARNING 'No se pudo corregir la vista public_bots a SECURITY INVOKER. Se requiere intervención manual.';
-    ELSE
-      RAISE NOTICE 'La vista public_bots ha sido corregida a SECURITY INVOKER correctamente.';
-    END IF;
-  ELSE
-    RAISE NOTICE 'La vista public_bots está configurada correctamente como SECURITY INVOKER.';
-  END IF;
-END $$;
+-- Nota: Se ha eliminado la verificación de security_invoker para public_bots
 
 -- ---------- SECCIÓN 6: VISTAS PARA ANÁLISIS AVANZADO ----------
   
 -- Vista para resumen de actividad de usuarios
-CREATE OR REPLACE VIEW user_activity_summary 
-WITH (security_invoker=true) 
-AS WITH user_message_counts AS (
+CREATE OR REPLACE VIEW user_activity_summary AS WITH user_message_counts AS (
   SELECT 
     c.user_id,
     COUNT(CASE WHEN m.is_user = TRUE THEN 1 END) AS user_messages,
     COUNT(CASE WHEN m.is_user = FALSE THEN 1 END) AS bot_messages
   FROM public.conversations c
   JOIN public.messages m ON c.id = m.conversation_id
-  WHERE c.deleted_at IS NULL
+  WHERE 1=1
   GROUP BY c.user_id
 ),
 search_counts AS (
@@ -636,7 +535,7 @@ LEFT JOIN
 LEFT JOIN
   app.documents d ON dc.id = d.collection_id AND d.deleted_at IS NULL
 LEFT JOIN
-  public.conversations c ON u.id = c.user_id AND c.deleted_at IS NULL
+  public.conversations c ON u.id = c.user_id
 LEFT JOIN
   public.links l ON u.id = l.user_id
 LEFT JOIN
@@ -654,7 +553,6 @@ COMMENT ON VIEW user_activity_summary IS 'Resumen completo de actividad por usua
 
 -- Vista materializada de user_activity_summary para mejor rendimiento en dashboards
 CREATE MATERIALIZED VIEW user_activity_summary_mat
-WITH (security_invoker=true) 
 AS SELECT *, NOW() AS last_refresh
 FROM user_activity_summary;
 
@@ -666,9 +564,7 @@ CREATE INDEX idx_user_activity_summary_mat_last_login ON user_activity_summary_m
 COMMENT ON MATERIALIZED VIEW user_activity_summary_mat IS 'Vista materializada de resumen de actividad de usuarios con actualización programada';
 
 -- Vista para métricas de búsqueda vectorial
-CREATE OR REPLACE VIEW vector_search_metrics 
-WITH (security_invoker=true) 
-AS SELECT
+CREATE OR REPLACE VIEW vector_search_metrics AS SELECT
   DATE(va.created_at) AS search_date,
   va.user_id,
   u.username,
@@ -697,9 +593,7 @@ ORDER BY
 COMMENT ON VIEW vector_search_metrics IS 'Métricas detalladas de búsquedas vectoriales para análisis de rendimiento y uso (últimos 30 días)';
 
 -- Vista para métricas de calidad de bots
-CREATE OR REPLACE VIEW bot_quality_metrics 
-WITH (security_invoker=true) 
-AS WITH feedback_categories_agg AS (
+CREATE OR REPLACE VIEW bot_quality_metrics AS WITH feedback_categories_agg AS (
   SELECT 
     category_counts.bot_id,
     jsonb_object_agg(category, count) AS categories_json
@@ -711,7 +605,6 @@ AS WITH feedback_categories_agg AS (
     FROM public.conversations c
     JOIN public.messages m ON c.id = m.conversation_id
     JOIN app.bot_response_feedback f ON m.id = f.message_id
-    WHERE c.deleted_at IS NULL
     GROUP BY c.bot_id, category
   ) AS category_counts
   GROUP BY category_counts.bot_id
@@ -744,7 +637,7 @@ FROM
 JOIN
   app.users u ON b.user_id = u.id
 LEFT JOIN
-  public.conversations c ON b.id = c.bot_id AND c.deleted_at IS NULL
+  public.conversations c ON b.id = c.bot_id
 LEFT JOIN
   public.messages m ON c.id = m.conversation_id
 LEFT JOIN
@@ -762,9 +655,7 @@ GROUP BY
 COMMENT ON VIEW bot_quality_metrics IS 'Métricas detalladas de calidad, rendimiento y satisfacción para bots';
 
 -- Vista para estado de procesamiento de documentos
-CREATE OR REPLACE VIEW document_processing_status 
-WITH (security_invoker=true) 
-AS SELECT
+CREATE OR REPLACE VIEW document_processing_status AS SELECT
   d.id AS document_id,
   d.title,
   dc.id AS collection_id,
@@ -847,40 +738,8 @@ CREATE OR REPLACE VIEW quota_notifications AS
 
 -- ---------- SECCIÓN 8: VERIFICAR SECURITY INVOKER EN TODAS LAS VISTAS ----------
 
--- Verificar que todas las vistas tienen SECURITY INVOKER
-DO $$
-DECLARE
-  definer_views TEXT[];
-  view_name TEXT;
-  view_schema TEXT;
-BEGIN
-  CREATE TEMP TABLE temp_views AS
-  SELECT schemaname, viewname
-  FROM pg_views
-  WHERE schemaname IN ('public', 'app')
-  AND securitypolicy = true; -- true = SECURITY DEFINER
-  
-  IF EXISTS (SELECT 1 FROM temp_views) THEN
-    SELECT array_agg(schemaname || '.' || viewname) INTO definer_views FROM temp_views;
-    
-    RAISE WARNING 'Las siguientes vistas todavía tienen SECURITY DEFINER: %', definer_views;
-    
-    -- Intentar corregir automáticamente cada vista
-    FOR view_schema, view_name IN SELECT schemaname, viewname FROM temp_views LOOP
-      RAISE NOTICE 'Intentando corregir vista %.%...', view_schema, view_name;
-      BEGIN
-        EXECUTE format('ALTER VIEW %I.%I SET (security_invoker=true)', view_schema, view_name);
-        RAISE NOTICE 'Vista %.% corregida exitosamente.', view_schema, view_name;
-      EXCEPTION WHEN OTHERS THEN
-        RAISE WARNING 'No se pudo corregir automáticamente la vista %.%: %', view_schema, view_name, SQLERRM;
-      END;
-    END LOOP;
-  ELSE
-    RAISE NOTICE 'Todas las vistas están configuradas correctamente como SECURITY INVOKER.';
-  END IF;
-  
-  DROP TABLE IF EXISTS temp_views;
-END $$;
+-- Nota: Se ha eliminado la verificación automática de security_invoker en las vistas
+-- Ya que todas las vistas se están creando explícitamente sin la cláusula security_invoker
 
 -- ---------- SECCIÓN 9: PARTICIONAMIENTO DE MENSAJES ----------
 
@@ -1182,9 +1041,7 @@ BEGIN
     END AS severity
   FROM 
     public.conversations c
-  WHERE 
-    c.deleted_at IS NULL AND
-    EXISTS (
+  WHERE EXISTS (
       SELECT 1 FROM public.messages m 
       WHERE m.conversation_id = c.id AND m.is_user = TRUE
       AND m.created_at > NOW() - INTERVAL '1 day'
@@ -1236,8 +1093,7 @@ BEGIN
   JOIN public.conversations c ON m.conversation_id = c.id
   WHERE 
     m.is_user = FALSE AND 
-    m.created_at > NOW() - INTERVAL '1 hour' AND
-    c.deleted_at IS NULL
+    m.created_at > NOW() - INTERVAL '1 hour'
   GROUP BY EXTRACT(HOUR FROM m.created_at)
   HAVING AVG(latency_ms) > 1000;
 END;

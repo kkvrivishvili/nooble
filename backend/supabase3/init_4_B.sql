@@ -201,6 +201,7 @@ CREATE TABLE IF NOT EXISTS public.conversations (
   language VARCHAR(10),
   metadata JSONB DEFAULT '{}',
   last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  deleted_at TIMESTAMP WITH TIME ZONE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -209,6 +210,7 @@ CREATE TABLE IF NOT EXISTS public.conversations (
 CREATE INDEX idx_conversations_user ON public.conversations(user_id, last_activity_at DESC);
 CREATE INDEX idx_conversations_bot ON public.conversations(bot_id);
 CREATE INDEX idx_conversations_public ON public.conversations(is_public) WHERE is_public = TRUE;
+CREATE INDEX idx_conversations_deleted_at ON public.conversations(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE INDEX idx_conversations_pinned ON public.conversations(user_id, is_pinned) WHERE is_pinned = TRUE;
 CREATE INDEX idx_conversations_recent ON public.conversations(last_activity_at DESC);
 
