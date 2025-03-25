@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  query-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - embeddings-service
+    restart: unless-stopped
+    volumes:
+      - ./:/app
+    networks:
+      - llama-net
+
+  embeddings-service:
+    build:
+      context: ../embeddings-service
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    env_file:
+      - ../embeddings-service/.env
+    depends_on:
+      - redis
+    restart: unless-stopped
+    volumes:
+      - ../embeddings-service:/app
+    networks:
+      - llama-net
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis-data:/data
+    networks:
+      - llama-net
+
+networks:
+  llama-net:
+    driver: bridge
+
+volumes:
+  redis-data:
